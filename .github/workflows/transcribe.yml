@@ -1,11 +1,11 @@
 name: transcribe
 
-# Public repo: input audio is an encrypted release asset, output is an encrypted release asset.
+# Public repo: input audio is an encrypted blob on a temp branch, output is pushed there encrypted; the branch is deleted after.
 # The one-time key arrives as a dispatch input, is masked, and is never written to env or logs.
 on:
   workflow_dispatch:
     inputs:
-      tag: {description: "release tag holding audio.enc", required: true, type: string}
+      tag: {description: "temp branch holding audio.enc + prompt.enc", required: true, type: string}
       cuts: {description: "comma list of cut times in seconds (N+1 values for N parts)", required: true, type: string}
       parts: {description: "JSON list of part indexes, e.g. [0,1,2]", required: true, type: string}
       lang: {description: "language", required: false, default: "ar", type: string}
@@ -35,12 +35,12 @@ jobs:
           K=$(jq -r .inputs.k "$GITHUB_EVENT_PATH"); echo "::add-mask::$K"
           [[ "$TAG" =~ ^[A-Za-z0-9._-]{1,80}$ ]] || { echo "bad tag"; exit 1; }
           cd "$RUNNER_TEMP"
-          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p audio.enc
+          git clone -q --depth 1 -b "$TAG" "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY" d && cp d/audio.enc d/prompt.enc .
           openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass "pass:$K" -in audio.enc -out a.flac
           sudo apt-get install -y -qq ffmpeg >/dev/null 2>&1 || true
           ffmpeg -v error -y -i a.flac -ac 1 -ar 16000 a.wav
           pip install -q faster-whisper
-          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass "pass:$K" -in <(gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p prompt.enc -O -) -out prompt.txt
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass "pass:$K" -in prompt.enc -out prompt.txt
           python3 - <<'PY'
           import json, os, wave, numpy as np
           from faster_whisper import WhisperModel
@@ -56,5 +56,7 @@ jobs:
           json.dump(out,open("tr.json","w"),ensure_ascii=False)
           PY
           openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -salt -pass "pass:$K" -in tr.json -out "tr_$PART.enc"
-          gh release upload "$TAG" "tr_$PART.enc" -R "$GITHUB_REPOSITORY" --clobber
+          cd d && cp "../tr_$PART.enc" . && git config user.name bot && git config user.email bot@users.noreply.github.com && git add "tr_$PART.enc" && git commit -q -m "tr $PART"
+          for i in 1 2 3 4 5; do git push -q origin "HEAD:$TAG" && break || { git pull -q --rebase origin "$TAG"; sleep $((RANDOM % 5 + 2)); }; done
+          cd ..
           rm -f a.flac a.wav tr.json prompt.txt
