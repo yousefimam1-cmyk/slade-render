@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       reels:
-        description: "comma list of reel ids, e.g. rG1,rG1s,rG2,rG2s"
+        description: "comma list of reel ids (rG1,rG2) and/or YouTube parts (y1-aud,y1-c01,...)"
         required: true
         type: string
       bundle_tag:
@@ -69,6 +69,13 @@ jobs:
 
       - name: pip
         run: pip install -r requirements.txt
+
+      - name: cache demucs weights (YouTube aud parts with Discord isolation)
+        if: endsWith(matrix.reel, '-aud')
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/torch
+          key: torch-hub-htdemucs-v1
 
       - name: cache week
         id: wk

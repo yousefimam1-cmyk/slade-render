@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One reel, one runner:  job.sh <reel> <dir with REEL.tar.enc + code.tar.enc> <outdir>
+# One reel (or one YouTube part, e.g. y1-aud / y1-c03), one runner:  job.sh <id> <dir with ID.tar.enc + code.tar.enc> <outdir>
 # env RENDER_KEY (repo secret). Writes <outdir>/<reel>.out.tar.enc = reels/<reel>.mp4 + .caption.txt + .srt + render.log.
 # The public log only shows progress lines; the full log (it can contain transcript text) travels encrypted.
 set -euo pipefail
@@ -18,6 +18,23 @@ dec "$IN/$REEL.tar.enc" "$W"
 mkdir -p "$W/pkg/reels" "$W/render" "$W/tmp"
 export TMPDIR="$W/tmp"     # private temp: farm_pro's one-render lock and work files stay per job
 LOG="$W/pkg/render.log"; rc=0
+if [ -f "$W/bundle/job.json" ]; then
+  # ---- YouTube part (farm_yt4): "<vid>-aud" = whole audio track + sidecars, "<vid>-cNN" = one frame-exact video chunk ----
+  mkdir -p "$W/pkg/yt"
+  {
+    echo "reel $REEL | $(nproc) vCPU | $(ffmpeg -version | head -1)"
+    if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("need_demucs") else 1)' "$W/bundle/job.json"; then
+      echo "STEP demucs install"
+      pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu && pip install --quiet demucs soundfile
+    fi
+    YT_PRESET="${YT_PRESET:-veryfast}" YT_CRF="${YT_CRF:-20}" python3 "$W/code/farm_yt4.py" --job "$W/bundle" --out "$W/pkg/yt"
+  } >"$LOG" 2>&1 || rc=$?
+  grep -E '^(STEP |OK  |FAIL |reel [A-Za-z0-9_-]+ \|)' "$LOG" || true
+  ls "$W/pkg/yt" | grep -qE '\.(mp4|m4a)$' || { [ $rc -ne 0 ] || rc=1; echo "no part produced (full log is in the encrypted output)"; }
+  tar -C "$W/pkg" -cf - . | "${OSSL[@]}" -e -salt -out "$OUT/$REEL.out.tar.enc"
+  echo "encrypted output: $REEL.out.tar.enc ($(du -h "$OUT/$REEL.out.tar.enc" | cut -f1)) rc=$rc"
+  exit $rc
+fi
 {
   echo "reel $REEL | $(nproc) vCPU | $(ffmpeg -version | head -1)"
   python3 "$HERE/assemble.py" "$W/bundle" "$(nproc)" && \

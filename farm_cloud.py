@@ -6,6 +6,8 @@
   farm_cloud.py run <tag> <reels>               dispatch render.yml (reels = comma list)
   farm_cloud.py wait [--timeout S]              poll the dispatched run until it finishes
   farm_cloud.py fetch <outdir> [--keep]         download the encrypted *.out.tar.enc artifacts, then delete artifacts + release
+  farm_cloud.py ytparts <plan.json> <pieces dir> y1,y2 [--scripts DIR]
+                                                print the YouTube part ids (y1-aud,y1-c01,...) = the PC's yt_parts.txt (same farm_yt4 chunk plan)
 
 This side never sees RENDER_KEY: it only moves encrypted blobs (openssl "Salted__" format) between the PC and GitHub.
 Encryption/decryption happen on the PC (rf_pc.py) and in the workflow (repo secret).
@@ -125,12 +127,24 @@ def cmd_fetch(a):
         if tag: gh("release", "delete", tag, "-R", REPO, "--yes", "--cleanup-tag", check=False); print(f"artifacts + release {tag} deleted")
     print(f"{len(got)} encrypted outputs in {a.outdir}: copy them to the PC scan\\agent\\cloud_out and run CLOUD_FETCH_DECRYPT.bat")
 
+def cmd_ytparts(a):
+    sys.path.insert(0, a.scripts); import farm_yt4 as Y
+    plan = json.load(open(a.plan, encoding="utf-8-sig")); P = Y.pieces_of(a.pieces); ids = []
+    for vid in a.vids.split(","):
+        y = next(v for v in plan["youtube"] if v["id"] == vid); cp = Y.plan_chunks(y, P)
+        ids += [f"{vid}-aud"] + [f"{vid}-{c['part']}" for c in cp["chunks"]]
+        print(f"{vid}: {cp['T']:.1f}s, {len(cp['chunks'])} chunks: " + " ".join(f"{c['part']}={c['secs']:.0f}s" for c in cp["chunks"]), file=sys.stderr)
+    if len(ids) > 20: print(f"note: {len(ids)} jobs > 20 parallel runners: the rest queue", file=sys.stderr)
+    print(",".join(ids))
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter); sp = ap.add_subparsers(dest="cmd", required=True)
     p = sp.add_parser("split"); p.add_argument("plan"); p.add_argument("mode", choices=["asap", "streaming"]); p.set_defaults(f=cmd_split)
     p = sp.add_parser("upload"); p.add_argument("bundle_dir"); p.add_argument("tag"); p.set_defaults(f=cmd_upload)
     p = sp.add_parser("run"); p.add_argument("tag"); p.add_argument("reels"); p.set_defaults(f=cmd_run)
     p = sp.add_parser("wait"); p.add_argument("--run-id"); p.add_argument("--timeout", type=int, default=3 * 3600); p.add_argument("--interval", type=int, default=30); p.set_defaults(f=cmd_wait)
+    p = sp.add_parser("ytparts"); p.add_argument("plan"); p.add_argument("pieces"); p.add_argument("vids")
+    p.add_argument("--scripts", default=os.environ.get("SLADE_SCRIPTS", "/mnt/user-data/outputs/Scripts")); p.set_defaults(f=cmd_ytparts)
     p = sp.add_parser("fetch"); p.add_argument("outdir"); p.add_argument("--run-id"); p.add_argument("--tag")
     p.add_argument("--keep", action="store_true", help="keep artifacts + release"); p.set_defaults(f=cmd_fetch)
     a = ap.parse_args(argv); return a.f(a) or 0

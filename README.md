@@ -55,6 +55,22 @@ A cut made with input `-ss` and no `-avoid_negative_ts` keeps an mp4 edit list, 
    Commit the `*.out.tar.enc` files to the PC's `scan\agent\cloud_out\`.
 5. PC: run `CLOUD_FETCH_DECRYPT.bat`.
 
+## YouTube videos (farm_yt4)
+
+A long video is split into parts that run in parallel: `<vid>-aud` renders the whole audio track in one pass, plus the captions sidecars,
+chapters, description and thumbnail. Each `<vid>-cNN` renders one frame-exact video chunk of about 150 s, cut on hard-cut boundaries. The PC
+joins them by stream copy (`yt_join.py`), so there are no re-encodes and no audio seams.
+
+| step | where | command |
+|---|---|---|
+| bundles | PC | `YT_CLOUD_PREP.bat [pro_plan_v5.json] [y1,y2]` → `scan\agent\segs\<vid>-<part>.tar.enc`, `code.tar.enc`, `yt_parts.txt` |
+| part ids | sandbox | `farm_cloud.py ytparts <plan> <pieces dir> y1,y2` (the same list as yt_parts.txt) |
+| render | sandbox | `farm_cloud.py upload <dir> <tag>` → `run <tag> <ids>` → `wait` → `fetch <outdir>` |
+| decrypt + join | PC | `CLOUD_FETCH_DECRYPT.bat` (joins as soon as all parts of a video are there); `YT_JOIN.bat` by hand |
+
+`cloud/job.sh` detects a YouTube part by `bundle/job.json`. An aud part whose plan has `discord_audio` installs CPU torch and demucs first;
+their weights are cached. `tests/yt_local_test.sh <dir> y1,y2` runs the whole chain locally with a throwaway key.
+
 ## Test
 
 `tests/local_test.sh` runs the whole chain on a synthetic 2-audio-track stream with a throwaway key:
@@ -65,3 +81,7 @@ A cut made with input `-ss` and no `-avoid_negative_ts` keeps an mp4 edit list, 
 4. Python decrypt.
 
 It then compares the result with a direct farm_pro render of the full source (duration and PSNR), which catches any time offset.
+
+## New stream button (PC-side, no Claude, no `gh`)
+
+Slade Hub's "New stream" tab runs `pc/NEW_STREAM.bat` (`new_stream.py`): extract audio, transcribe (local, Scribe opt-in), clip + plan draft (`ns_plan.py`, follows `knowledge/SLADE_EDIT_RULES.md`), cut, encrypt, then **`pc/rf_cloud_pc.py`** (stdlib, GitHub REST) does what `farm_cloud.py` does with `gh`: release, asset upload, workflow dispatch, poll, artifact download, cleanup. One-time on the PC: `SET_RENDER_KEY.bat`, and `SET_GH_TOKEN.bat` with a **fine-grained token for this repo only** (Actions: read+write, Contents: read+write), stored as user env var `GH_RENDER_TOKEN`. `prep_segments.py` now honours `SEGS_OUT` / `SCRIPTS` env vars in the generated `CUT_SEGMENTS.bat` (per-stream folders) and no longer needs `farm_cloud.py` unless `--mode` is used. Tests: `python tests/test_new_stream.py`, `python tests/test_rf_cloud_pc.py`. Full notes: Hub README ("NEW STREAM -> CONTENT").

@@ -2,7 +2,11 @@
 """PC side of the Slade render farm. RENDER_KEY lives only here (user env var, SET_RENDER_KEY.bat) and in the repo secret.
 
   rf_pc.py bundle  [--segs DIR] [--reels r01,rG1]   pieces + assets + plan -> <segs>\\<reel>.tar.enc, + code.tar.enc
-  rf_pc.py decrypt [--in DIR] [--out DIR]          <in>\\*.out.tar.enc -> reels folder (mp4 + caption.txt + srt), logs\\
+  rf_pc.py ytbundle --plan pro_plan_v5.json --vids y1,y2 [--segs DIR]
+                                                   YouTube: one bundle per part (<vid>-aud = audio track + sidecars, <vid>-cNN = video chunk)
+                                                   -> <segs>\\<vid>-<part>.tar.enc + code.tar.enc + yt_parts.txt (the id list for the cloud run)
+  rf_pc.py decrypt [--in DIR] [--out DIR]          <in>\\*.out.tar.enc -> reels folder (mp4 + caption.txt + srt), YouTube parts -> youtube\\<vid>\\
+                                                   (joined into youtube\\<vid>.mp4 as soon as every part of a video is there), logs\\
   rf_pc.py check                                   key present? which cipher backend?
   rf_pc.py enc <in.tar> <out.enc> | dec <in.enc> <out.tar>   raw file primitives (tests)
 
@@ -14,8 +18,8 @@ import os, re, io, sys, json, glob, shutil, tarfile, argparse, subprocess
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ITER, MAGIC = 200000, b"Salted__"
-CODE_FILES = ["farm_pro.py", "farm_gpu.py", "farm_sfx.py", "farm_caps.py"]
-CODE_DIRS = ["g30_sfx", "g30_fonts"]
+CODE_FILES = ["farm_pro.py", "farm_gpu.py", "farm_sfx.py", "farm_caps.py", "farm_yt4.py", "farm_discord.py", "farm_music.py", "yt_join.py", "gaming.cube"]
+CODE_DIRS = ["g30_sfx", "g30_fonts", "fonts", "models", os.path.join("memes", "synth")]
 CHUNK = 1 << 20
 
 def key():
@@ -128,6 +132,15 @@ def dec_file(src, out):
             for b in iter(lambda: r.read(CHUNK), b""): fo.write(b)
 
 # ---- bundle ----
+def stage_code(scripts, stage, segs):
+    c = os.path.join(stage, "code"); os.makedirs(c, exist_ok=True)
+    for f in CODE_FILES:
+        if os.path.isfile(os.path.join(scripts, f)): shutil.copy2(os.path.join(scripts, f), c)
+    if not os.path.isfile(os.path.join(c, "farm_pro.py")): sys.exit(f"farm_pro.py not found in {scripts}")
+    for d in CODE_DIRS:
+        if os.path.isdir(os.path.join(scripts, d)): shutil.copytree(os.path.join(scripts, d), os.path.join(c, d), dirs_exist_ok=True)
+    encrypt_tree(stage, "code", os.path.join(segs, "code.tar.enc")); print("code.tar.enc")
+
 def probe_dur(p):
     r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", p], capture_output=True, text=True)
     try: return float(r.stdout.strip())
@@ -148,13 +161,7 @@ def cmd_bundle(a):
     stage = os.path.join(segs, "_stage"); shutil.rmtree(stage, ignore_errors=True)
     print(f"cipher backend: {backend()}")
     try:
-        c = os.path.join(stage, "code"); os.makedirs(c)
-        for f in CODE_FILES:
-            if os.path.isfile(os.path.join(a.scripts, f)): shutil.copy2(os.path.join(a.scripts, f), c)
-        if not os.path.isfile(os.path.join(c, "farm_pro.py")): sys.exit(f"farm_pro.py not found in {a.scripts}")
-        for d in CODE_DIRS:
-            if os.path.isdir(os.path.join(a.scripts, d)): shutil.copytree(os.path.join(a.scripts, d), os.path.join(c, d))
-        encrypt_tree(stage, "code", os.path.join(segs, "code.tar.enc")); print("code.tar.enc")
+        stage_code(a.scripts, stage, segs)
         for rid in want:
             R = ps["reels"][rid]; warn = []; b = os.path.join(stage, rid, "bundle")
             for d in ("pieces", "memes", "propack"): os.makedirs(os.path.join(b, d))
@@ -183,6 +190,58 @@ def cmd_bundle(a):
     finally: shutil.rmtree(stage, ignore_errors=True)
     print(f"done: {len(want)} reels + code.tar.enc in {segs} (encrypted only: give these *.tar.enc to the agent)")
 
+def _extract_audio(src, dst):
+    """audio-only copy of a piece (both tracks, stream copy) for the YouTube audio part: a fraction of the upload"""
+    if os.path.exists(dst): return
+    r = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", src, "-map", "0:a", "-c", "copy", dst], capture_output=True, text=True)
+    if r.returncode: sys.exit(f"audio extract failed for {os.path.basename(src)}: {r.stderr[-300:]}")
+
+def cmd_ytbundle(a):
+    """one encrypted bundle per YouTube part: job.json + plan.json (youtube only) + the pieces that part reads + memes/propack it needs"""
+    sys.path.insert(0, a.scripts); import farm_yt4 as Y
+    segs = a.segs; key(); plan = json.load(open(os.path.join(a.scripts, a.plan) if not os.path.isabs(a.plan) else a.plan, encoding="utf-8-sig"))
+    pdir = os.path.join(segs, "pieces"); P = Y.pieces_of(pdir); names = [os.path.basename(p[2]) for p in P]
+    memes = os.path.join(segs, "assets", "memes"); ppd = os.path.join(segs, "assets", "propack")
+    ppf = [os.path.join(r, f) for r, _, fs in os.walk(ppd) for f in fs] if os.path.isdir(ppd) else []
+    yplan = {k: v for k, v in plan.items() if k not in ("reels", "post_order")}
+    stage = os.path.join(segs, "_stage_yt"); shutil.rmtree(stage, ignore_errors=True); ids = []
+    print(f"cipher backend: {backend()}")
+    try:
+        stage_code(a.scripts, stage, segs)
+        for vid in [v.strip() for v in a.vids.split(",") if v.strip()]:
+            y = next((v for v in plan["youtube"] if v["id"] == vid), None)
+            if not y: sys.exit(f"{vid} not in {a.plan}")
+            cp = Y.plan_chunks(y, P); want_m = {m["id"] for m in y.get("memes", []) if m.get("id")}; want_c = {m["clip"] for m in y.get("memes", []) if m.get("clip")}
+            parts = [dict(cp["aud"], part="aud")] + cp["chunks"]
+            for pt in parts:
+                pid = f"{vid}-{pt['part']}"; b = os.path.join(stage, pid, "bundle"); warn = []
+                for d in ("pieces", "memes", "propack"): os.makedirs(os.path.join(b, d))
+                for n in pt["pieces"]:
+                    src = os.path.join(pdir, n)
+                    if not os.path.isfile(src): sys.exit(f"{pid}: missing piece {n} (run CUT_YT.bat)")
+                    if pt["part"] == "aud": _extract_audio(src, os.path.join(b, "pieces", os.path.splitext(n)[0] + ".mka"))
+                    else: _put(src, os.path.join(b, "pieces", n))
+                if pt["part"] == "aud" and cp["aud"].get("thumb_piece"): _put(os.path.join(pdir, cp["aud"]["thumb_piece"]), os.path.join(b, "pieces", cp["aud"]["thumb_piece"]))
+                if os.path.isfile(os.path.join(memes, "manifest.json")): shutil.copy2(os.path.join(memes, "manifest.json"), os.path.join(b, "memes"))
+                for mid in want_m:
+                    f = os.path.join(memes, mid + ".wav")
+                    if os.path.isfile(f): _put(f, os.path.join(b, "memes", mid + ".wav"))
+                    else: warn.append(f"meme {mid}.wav missing")
+                for cn in want_c:
+                    hit = [f for f in ppf if norm(cn) and norm(cn) in norm(os.path.splitext(os.path.basename(f))[0])]
+                    for f in hit: _put(f, os.path.join(b, "propack", os.path.basename(f)))
+                    if not hit: warn.append(f"clip {cn} missing")
+                job = dict(vid=vid, part=pt["part"], pieces=names, chunks=cp["chunks"], frames=cp["frames"],
+                           need_demucs=bool(pt["part"] == "aud" and y.get("discord_audio")))
+                json.dump(job, open(os.path.join(b, "job.json"), "w"), indent=1)
+                json.dump(yplan, open(os.path.join(b, "plan.json"), "w", encoding="utf-8"), ensure_ascii=False)
+                out = encrypt_tree(os.path.join(stage, pid), "bundle", os.path.join(segs, pid + ".tar.enc"))
+                shutil.rmtree(os.path.join(stage, pid), ignore_errors=True); ids.append(pid)
+                print(f"{pid}.tar.enc  {os.path.getsize(out) / 2 ** 20:.1f} MB" + "".join(f"\n  WARNING {x}" for x in warn))
+    finally: shutil.rmtree(stage, ignore_errors=True)
+    open(os.path.join(segs, "yt_parts.txt"), "w").write(",".join(ids) + "\n")
+    print(f"done: {len(ids)} parts + code.tar.enc in {segs}\ncloud ids (yt_parts.txt): {','.join(ids)}")
+
 def cmd_decrypt(a):
     src = a.inp; out = a.out
     if not out:
@@ -191,21 +250,43 @@ def cmd_decrypt(a):
             stem = os.path.splitext(os.path.basename((ps.get("source") or "cloud").replace("\\", "/")))[0]
         except OSError: stem = "cloud"
         out = os.path.join(a.scripts, "scan", stem + ".pro", "reels")
-    os.makedirs(out, exist_ok=True); logs = os.path.join(src, "logs"); os.makedirs(logs, exist_ok=True); n = 0
+    os.makedirs(out, exist_ok=True); logs = os.path.join(src, "logs"); os.makedirs(logs, exist_ok=True); n = 0; yt_dirs = set()
     for e in sorted(glob.glob(os.path.join(src, "*.out.tar.enc"))):
         rid = os.path.basename(e)[:-len(".out.tar.enc")]; tmp = os.path.join(src, "_dec_" + rid)
         shutil.rmtree(tmp, ignore_errors=True); decrypt_tree(e, tmp)
         for f in glob.glob(os.path.join(tmp, "reels", "*")):
             if os.path.isfile(f): shutil.copy2(f, out)
+        ytf = [f for f in glob.glob(os.path.join(tmp, "yt", "*")) if os.path.isfile(f)]
+        if ytf:   # YouTube part: <vid>-aud (m4a + sidecars) or <vid>-cNN (video chunk)
+            vid = rid.split("-")[0]; yd = os.path.join(os.path.dirname(out), "youtube", vid); os.makedirs(yd, exist_ok=True)
+            for f in ytf: shutil.copy2(f, yd)
+            yt_dirs.add((vid, yd))
         if os.path.isfile(os.path.join(tmp, "render.log")): shutil.copy2(os.path.join(tmp, "render.log"), os.path.join(logs, rid + ".render.log"))
-        ok = os.path.isfile(os.path.join(tmp, "reels", rid + ".mp4")); shutil.rmtree(tmp, ignore_errors=True); n += ok
+        ok = os.path.isfile(os.path.join(tmp, "reels", rid + ".mp4")) or any(f.endswith((".mp4", ".m4a")) for f in ytf); shutil.rmtree(tmp, ignore_errors=True); n += ok
         print(f"{'OK  ' if ok else 'FAIL'} {rid}" + ("" if ok else f"  (see {logs}\\{rid}.render.log)"))
-    print(f"{n} reels -> {out}")
+    for vid, yd in sorted(yt_dirs): yt_try_join(a.scripts, vid, yd)
+    print(f"{n} parts/reels decrypted; reels -> {out}")
+
+def yt_try_join(scripts, vid, yd):
+    """join <yd>/<vid>-cNN.mp4 + <vid>.m4a -> youtube/<vid>.mp4 (+ sidecars) once every part is there"""
+    pj = os.path.join(yd, vid + ".parts.json")
+    if not os.path.isfile(pj): print(f"{vid}: waiting for the aud part (parts.json)"); return
+    need = [f"{vid}-{c['part']}.mp4" for c in json.load(open(pj))["chunks"]] + [vid + ".m4a"]
+    miss = [x for x in need if not os.path.isfile(os.path.join(yd, x))]
+    if miss: print(f"{vid}: still missing {', '.join(miss)}"); return
+    sys.path.insert(0, scripts); import yt_join
+    final = os.path.join(os.path.dirname(yd), vid + ".mp4"); yt_join.join(yd, vid, final)
+    for ext in (".srt", ".layout.json", ".chapters.txt", ".description.txt", ".thumbnail.png"):
+        if os.path.isfile(os.path.join(yd, vid + ext)): shutil.copy2(os.path.join(yd, vid + ext), os.path.dirname(yd))
+    print(f"{vid}: joined -> {final}")
+
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter); sp = ap.add_subparsers(dest="cmd", required=True)
     segs = os.path.join(HERE, "scan", "agent", "segs")
     p = sp.add_parser("bundle"); p.add_argument("--segs", default=segs); p.add_argument("--reels"); p.add_argument("--scripts", default=HERE); p.set_defaults(f=cmd_bundle)
+    p = sp.add_parser("ytbundle"); p.add_argument("--plan", required=True); p.add_argument("--vids", required=True); p.add_argument("--segs", default=segs)
+    p.add_argument("--scripts", default=HERE); p.set_defaults(f=cmd_ytbundle)
     p = sp.add_parser("decrypt"); p.add_argument("--in", dest="inp", default=os.path.join(HERE, "scan", "agent", "cloud_out")); p.add_argument("--out")
     p.add_argument("--segs", default=segs); p.add_argument("--scripts", default=HERE); p.set_defaults(f=cmd_decrypt)
     p = sp.add_parser("check"); p.set_defaults(f=lambda a: (key(), print(f"RENDER_KEY set, cipher backend {backend()}")) and 0)
