@@ -1,0 +1,144 @@
+name: render
+
+# Public repo: every input is an encrypted release asset, every output an encrypted artifact (1 day).
+# Plaintext media / plans / captions / full logs only exist inside the runner's temp dir.
+on:
+  workflow_dispatch:
+    inputs:
+      reels:
+        description: "comma list of reel ids, e.g. rG1,rG1s,rG2,rG2s"
+        required: true
+        type: string
+      bundle_tag:
+        description: "release tag holding <reel>.tar.enc + code.tar.enc"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: render-${{ github.event.inputs.bundle_tag }}
+  cancel-in-progress: false
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      reels: ${{ steps.m.outputs.reels }}
+    steps:
+      - id: m
+        env:
+          REELS: ${{ inputs.reels }}
+          TAG: ${{ inputs.bundle_tag }}
+        run: |
+          [[ "$TAG" =~ ^[A-Za-z0-9._-]{1,80}$ ]] || { echo "bad bundle_tag"; exit 1; }
+          json=$(python3 - <<'EOF'
+          import json, os, re, sys
+          ids = [x.strip() for x in os.environ["REELS"].split(",") if x.strip()]
+          if not ids or not all(re.fullmatch(r"[A-Za-z0-9_-]{1,40}", x) for x in ids): sys.exit("bad reels input")
+          print(json.dumps(list(dict.fromkeys(ids))))
+          EOF
+          )
+          echo "reels=$json" >> "$GITHUB_OUTPUT"
+          echo "matrix: $json"
+
+  render:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      max-parallel: 20          # free plan limit for concurrent jobs
+      matrix:
+        reel: ${{ fromJSON(needs.setup.outputs.reels) }}
+    name: render (${{ matrix.reel }})
+    env:
+      FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+      FF_DIR: ${{ github.workspace }}/.cache/ffmpeg
+      FONT_DIR: ${{ github.workspace }}/.cache/fonts
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: pip
+        run: pip install -r requirements.txt
+
+      - name: cache week
+        id: wk
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: cache ffmpeg
+        id: ffc
+        uses: actions/cache@v4
+        with:
+          path: .cache/ffmpeg
+          key: ffmpeg-btbn-master-gpl-${{ steps.wk.outputs.week }}
+
+      - name: static ffmpeg (BtbN, libass + fribidi + harfbuzz)
+        if: steps.ffc.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$FF_DIR"
+          curl -fsSL --retry 3 "$FFMPEG_URL" | tar -xJ -C "$FF_DIR" --strip-components=2 --wildcards '*/bin/ffmpeg' '*/bin/ffprobe'
+
+      - name: ffmpeg on PATH + capability check
+        run: |
+          echo "$FF_DIR" >> "$GITHUB_PATH"
+          "$FF_DIR/ffmpeg" -hide_banner -version | head -1
+          cfg=$("$FF_DIR/ffmpeg" -hide_banner -buildconf)
+          for lib in libass libfribidi libharfbuzz libx264 libfreetype; do grep -q -- "--enable-$lib" <<<"$cfg" || { echo "ffmpeg lacks $lib"; exit 1; }; done
+          "$FF_DIR/ffmpeg" -hide_banner -filters | grep -qE ' ass ' || { echo "no ass filter"; exit 1; }
+
+      - name: cache fonts
+        id: fc
+        uses: actions/cache@v4
+        with:
+          path: .cache/fonts
+          key: fonts-tajawal-notoemoji-v1
+
+      - name: fonts (Tajawal, Noto Color Emoji)
+        if: steps.fc.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$FONT_DIR"
+          for w in Regular Medium Bold ExtraBold Black; do
+            curl -fsSL --retry 3 -o "$FONT_DIR/Tajawal-$w.ttf" "https://raw.githubusercontent.com/google/fonts/main/ofl/tajawal/Tajawal-$w.ttf"
+          done
+          curl -fsSL --retry 3 -o "$FONT_DIR/NotoColorEmoji.ttf" "https://raw.githubusercontent.com/google/fonts/main/ofl/notocoloremoji/NotoColorEmoji-Regular.ttf"
+
+      - name: install fonts
+        run: |
+          mkdir -p ~/.fonts && cp "$FONT_DIR"/Tajawal-*.ttf ~/.fonts/
+          sudo mkdir -p /usr/share/fonts/truetype/noto && sudo cp "$FONT_DIR/NotoColorEmoji.ttf" /usr/share/fonts/truetype/noto/
+          fc-cache -f >/dev/null
+
+      - name: download encrypted bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.bundle_tag }}
+          REEL: ${{ matrix.reel }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/in"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D "$RUNNER_TEMP/in" -p "$REEL.tar.enc" -p code.tar.enc
+          for f in "$RUNNER_TEMP"/in/*; do [ "$(head -c 8 "$f")" = "Salted__" ] || { echo "not encrypted: $(basename "$f")"; exit 1; }; done
+
+      - name: decrypt, assemble, render, encrypt
+        env:
+          RENDER_KEY: ${{ secrets.RENDER_KEY }}
+          REEL: ${{ matrix.reel }}
+        run: bash cloud/job.sh "$REEL" "$RUNNER_TEMP/in" "$RUNNER_TEMP/out"
+
+      - name: upload encrypted output (1 day)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-${{ matrix.reel }}
+          path: ${{ runner.temp }}/out/*.out.tar.enc
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
