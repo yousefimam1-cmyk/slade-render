@@ -1,0 +1,60 @@
+name: transcribe
+
+# Public repo: input audio is an encrypted release asset, output is an encrypted release asset.
+# The one-time key arrives as a dispatch input, is masked, and is never written to env or logs.
+on:
+  workflow_dispatch:
+    inputs:
+      tag: {description: "release tag holding audio.enc", required: true, type: string}
+      cuts: {description: "comma list of cut times in seconds (N+1 values for N parts)", required: true, type: string}
+      parts: {description: "JSON list of part indexes, e.g. [0,1,2]", required: true, type: string}
+      lang: {description: "language", required: false, default: "ar", type: string}
+      k: {description: "one-time key", required: true, type: string}
+
+permissions:
+  contents: write
+
+jobs:
+  tr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        part: ${{ fromJSON(inputs.parts) }}
+    steps:
+      - name: transcribe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          CUTS: ${{ inputs.cuts }}
+          PART: ${{ matrix.part }}
+          LANG_: ${{ inputs.lang }}
+        run: |
+          set -euo pipefail
+          K=$(jq -r .inputs.k "$GITHUB_EVENT_PATH"); echo "::add-mask::$K"
+          [[ "$TAG" =~ ^[A-Za-z0-9._-]{1,80}$ ]] || { echo "bad tag"; exit 1; }
+          cd "$RUNNER_TEMP"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p audio.enc
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass "pass:$K" -in audio.enc -out a.flac
+          sudo apt-get install -y -qq ffmpeg >/dev/null 2>&1 || true
+          ffmpeg -v error -y -i a.flac -ac 1 -ar 16000 a.wav
+          pip install -q faster-whisper
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass "pass:$K" -in <(gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p prompt.enc -O -) -out prompt.txt
+          python3 - <<'PY'
+          import json, os, wave, numpy as np
+          from faster_whisper import WhisperModel
+          cuts=[float(x) for x in os.environ["CUTS"].split(",")]; p=int(os.environ["PART"]); a,b=cuts[p],cuts[p+1]
+          w=wave.open("a.wav"); A=np.frombuffer(w.readframes(w.getnframes()),dtype=np.int16).astype(np.float32)/32768
+          m=WhisperModel("large-v3",device="cpu",compute_type="int8",cpu_threads=4)
+          segs,_=m.transcribe(A[int(a*16000):int(b*16000)],language=os.environ["LANG_"],word_timestamps=True,vad_filter=True,beam_size=5,
+                              condition_on_previous_text=False,initial_prompt=open("prompt.txt",encoding="utf-8").read().strip() or None)
+          out=[]
+          for s in segs:
+              out.append({"s":s.start+a,"e":s.end+a,"t":s.text.strip(),"p":s.avg_logprob,"w":[[x.start+a,x.end+a,x.word,x.probability] for x in s.words]})
+              print("progress",round(s.end),"/",round(b-a),flush=True)
+          json.dump(out,open("tr.json","w"),ensure_ascii=False)
+          PY
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -salt -pass "pass:$K" -in tr.json -out "tr_$PART.enc"
+          gh release upload "$TAG" "tr_$PART.enc" -R "$GITHUB_REPOSITORY" --clobber
+          rm -f a.flac a.wav tr.json prompt.txt
