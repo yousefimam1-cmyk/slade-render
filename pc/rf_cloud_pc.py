@@ -4,10 +4,15 @@ Port of farm_cloud.py upload / run / wait / fetch to the GitHub REST API.
 
   rf_cloud_pc.py check                       token + repo access test (prints the repo and the permissions, never the token)
   rf_cloud_pc.py upload <bundle_dir> <tag>   create the release <tag>, upload every *.tar.enc (resumable: same name+size is skipped)
+                                             + upload-once source cache: the media assets <bundle_dir>\\cache\\index\\<id>.txt asks for go to the
+                                             long-lived release "src-cache" only if they are not there yet (old unused ones are pruned)
   rf_cloud_pc.py run <tag> <reel,reel,...>   dispatch render.yml, print the run id
   rf_cloud_pc.py wait [--run-id N]           poll the run until it finishes (exit 0 success, 1 failed, 2 timeout)
-  rf_cloud_pc.py fetch <outdir> [--run-id N] [--tag T] [--keep]
-                                             download the encrypted *.out.tar.enc artifacts, then delete artifacts + release + tag
+  rf_cloud_pc.py fetch <outdir> [--run-id N] [--tag T] [--keep] [--full]
+                                             download the encrypted *.out.tar.enc artifacts, then delete artifacts + release + tag.
+                                             Hand-off mode (repo secret SOCIAL_LAMMA_TOKEN): render-<id> is small (the video is already on Social Lamma),
+                                             a YouTube video joined in the cloud replaces its parts, and the videos (full-<id>) are only downloaded with
+                                             --full (they stay 1 day on GitHub, encrypted, so `fetch <outdir> --full` works later too)
   rf_cloud_pc.py delete <tag>                delete a release and its tag
 
 Auth: fine-grained token scoped to the slade-render repo only (Actions: read+write, Contents: read+write), saved by SET_GH_TOKEN.bat as
@@ -25,6 +30,10 @@ ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 TAG_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
 MAX_ASSET = 2 * 1024 ** 3 - 1          # GitHub release asset limit
 MAGIC = b"Salted__"
+CACHE_TAG = "src-cache"                 # long-lived release: content-addressed encrypted source media (never deleted by fetch/delete)
+CACHE_DAYS = int(os.environ.get("RF_CACHE_DAYS", "21"))
+ASSET_RE = re.compile(r"^f-[0-9a-f]{40}\.enc$")
+PART_RE = re.compile(r"^(.+)-(aud|c\d+)$")
 
 
 class GHError(Exception):
@@ -164,12 +173,13 @@ class GH:
                          "body": "encrypted render bundles (temporary)"}, what="release create")[1]
 
     def delete_release(self, tag):
+        if tag == CACHE_TAG: raise GHError("refusing to delete the source cache release")
         r = self.release_by_tag(tag)
         if r: self.call("DELETE", f"/repos/{self.repo}/releases/{r['id']}", ok=(204, 404), what="release delete")
         self.call("DELETE", f"/repos/{self.repo}/git/refs/tags/{tag}", ok=(204, 404, 422), what="tag delete")
         return bool(r)
 
-    def upload(self, bundle_dir, tag, progress=None):
+    def upload(self, bundle_dir, tag, progress=None, cache_dir=None):
         """-> {"release_id", "uploaded": [names], "skipped": [names]}. Resumable: an asset with the same name and size is not sent again."""
         if not TAG_RE.match(tag or ""): raise GHError("bad tag")
         files = sorted(glob.glob(os.path.join(bundle_dir, "*.tar.enc")))
@@ -190,8 +200,53 @@ class GH:
             if a: self.call("DELETE", f"/repos/{self.repo}/releases/assets/{a['id']}", ok=(204, 404), what="stale asset delete")
             self._put_asset(up_url, f, nm, sz, (lambda pc, n=nm: progress(n, pc)) if progress else None)
             sent.append(nm)
+        res = {"release_id": rel.get("id"), "uploaded": sent, "skipped": skipped}
+        ids = [os.path.basename(f)[:-len(".tar.enc")] for f in files]
+        res.update(self.cache_sync(cache_dir or os.path.join(bundle_dir, "cache"), ids, progress))
         state({"tag": tag, "repo": self.repo})
-        return {"release_id": rel.get("id"), "uploaded": sent, "skipped": skipped}
+        return res
+
+    # --- upload-once source cache ---
+    def _assets(self, rel):
+        out, page = [], 1
+        while True:
+            j = self.get(f"/repos/{self.repo}/releases/{rel['id']}/assets?per_page=100&page={page}", "asset list") or []
+            out += j
+            if len(j) < 100: return out
+            page += 1
+
+    def cache_sync(self, cache_dir, ids, progress=None):
+        """upload the cache assets these bundles need and GitHub does not have yet -> {"cache_uploaded": [...], "cache_skipped": [...]}"""
+        need = set()
+        for i in ids:
+            try:
+                with open(os.path.join(cache_dir, "index", i + ".txt")) as f: need |= {l.strip() for l in f if ASSET_RE.match(l.strip())}
+            except OSError: pass
+        if not need: return {"cache_uploaded": [], "cache_skipped": []}
+        for n in need:
+            p = os.path.join(cache_dir, n)
+            if not os.path.isfile(p): raise GHError(f"cache asset {n} missing on this PC: run the encrypt step again")
+            with open(p, "rb") as fh:
+                if fh.read(8) != MAGIC: raise GHError(f"cache asset {n} is not encrypted: refusing to upload")
+        rel = self.release_by_tag(CACHE_TAG)
+        if not rel:
+            rel = self.call("POST", f"/repos/{self.repo}/releases", {"tag_name": CACHE_TAG, "name": CACHE_TAG, "prerelease": True, "target_commitish": self.branch(),
+                            "body": "encrypted source media, content-addressed (uploaded once, reused by re-renders; unused assets pruned)"}, what="cache release create")[1]
+        have = {a["name"]: a for a in self._assets(rel)}
+        # prune: not needed now and older than CACHE_DAYS
+        cut = time.time() - CACHE_DAYS * 86400
+        for nm, a in list(have.items()):
+            ts = _ts(a.get("updated_at") or a.get("created_at"))
+            if nm not in need and ts is not None and ts < cut:
+                self.call("DELETE", f"/repos/{self.repo}/releases/assets/{a['id']}", ok=(204, 404), what="cache prune"); have.pop(nm)
+        up_url = (rel.get("upload_url") or "").split("{")[0] or f"https://uploads.github.com/repos/{self.repo}/releases/{rel['id']}/assets"
+        sent, skipped = [], []
+        for nm in sorted(need):
+            p = os.path.join(cache_dir, nm); sz = os.path.getsize(p); a = have.get(nm)
+            if a and a.get("size") == sz and a.get("state", "uploaded") == "uploaded": skipped.append(nm); continue
+            if a: self.call("DELETE", f"/repos/{self.repo}/releases/assets/{a['id']}", ok=(204, 404), what="stale cache asset delete")
+            self._put_asset(up_url, p, nm, sz, (lambda pc, n=nm: progress("cache " + n[:10], pc)) if progress else None); sent.append(nm)
+        return {"cache_uploaded": sent, "cache_skipped": skipped}
 
     def _put_asset(self, up_url, path, name, size, cb):
         url = up_url + "?" + urllib.parse.urlencode({"name": name})
@@ -247,36 +302,54 @@ class GH:
             self.sleep(interval)
 
     # --- results ---
-    def fetch(self, run_id, outdir, tag=None, keep=False, want=None):
-        """artifacts -> <outdir>/<reel>.out.tar.enc (still encrypted); then delete artifacts + release (+tag) unless keep.
-        -> {"got": [reel ids], "missing": [reel ids]}"""
+    def fetch(self, run_id, outdir, tag=None, keep=False, want=None, full=False):
+        """artifacts -> <outdir>/<id>.out.tar.enc (still encrypted); then delete artifacts + release (+tag) unless keep.
+        Only what the PC needs: a YouTube video joined in the cloud (render-<vid>) replaces its parts, and the full videos of handed-off
+        reels/episodes (full-<id>) come only with full=True (or a list of ids); left on GitHub they expire after 1 day.
+        -> {"got": [ids], "missing": [ids], "full": [ids downloaded], "full_available": [ids left on GitHub]}"""
         os.makedirs(outdir, exist_ok=True)
         arts = (self.get(f"/repos/{self.repo}/actions/runs/{run_id}/artifacts?per_page=100", "artifact list") or {}).get("artifacts", [])
         arts = [a for a in arts if not a.get("expired")]
-        got = []; tmp = tempfile.mkdtemp(prefix="rf_art_")
+        names = {a["name"] for a in arts}
+        rend = {a["name"][7:] for a in arts if a["name"].startswith("render-")}
+        joined = {x for x in rend if not PART_RE.match(x) and any(PART_RE.match(y) and PART_RE.match(y).group(1) == x for y in rend)}
+        want_full = (lambda i: True) if full is True else (lambda i: i in set(full or []))
+        pick, skip = [], []
+        for a in arts:
+            n = a["name"]
+            if n.startswith("full-"): (pick if want_full(n[5:]) else skip).append(a)
+            else:                                                                    # render-<id> (or any older name): the normal output
+                m = PART_RE.match(n[7:] if n.startswith("render-") else n)
+                (skip if m and m.group(1) in joined else pick).append(a)
+        got = []; gfull = []; tmp = tempfile.mkdtemp(prefix="rf_art_")
         try:
-            for a in arts:
+            for a in pick:
                 z = os.path.join(tmp, f"a{a['id']}.zip")
                 self._download_zip(a["id"], z)
                 with zipfile.ZipFile(z) as zf:
                     for n in zf.namelist():
                         b = os.path.basename(n)
-                        if not b.endswith(".out.tar.enc"): continue                  # basename only: no path tricks from the zip
+                        suf = ".out.tar.enc" if b.endswith(".out.tar.enc") else ".full.tar.enc" if b.endswith(".full.tar.enc") else None
+                        if not suf: continue                                         # basename only: no path tricks from the zip
                         with zf.open(n) as src:
                             head = src.read(8)
                             if head != MAGIC: self.log("skipping non-encrypted file " + b); continue
                             dst = os.path.join(outdir, b)
                             with open(dst + ".part", "wb") as f:
                                 f.write(head); shutil.copyfileobj(src, f, 1 << 20)
-                            os.replace(dst + ".part", dst); got.append(b[:-len(".out.tar.enc")])
+                            os.replace(dst + ".part", dst); (got if suf == ".out.tar.enc" else gfull).append(b[:-len(suf)])
                 os.remove(z)
         finally: shutil.rmtree(tmp, ignore_errors=True)
         want = set(want if want is not None else (state().get("reels") or []))
-        out = {"got": sorted(set(got)), "missing": sorted(want - set(got))}
-        if got and not keep:
-            for a in arts: self.call("DELETE", f"/repos/{self.repo}/actions/artifacts/{a['id']}", ok=(204, 404), what="artifact delete")
+        have = set(got) | {w for w in want if PART_RE.match(w) and PART_RE.match(w).group(1) in joined and PART_RE.match(w).group(1) in got}
+        out = {"got": sorted(set(got)), "missing": sorted(want - have) if any(not a["name"].startswith("full-") for a in arts) else [], "full": sorted(set(gfull)),
+               "full_available": sorted(a["name"][5:] for a in skip if a["name"].startswith("full-"))}
+        if (got or gfull) and not keep:
+            for a in arts:
+                if a["name"].startswith("full-") and a not in pick: continue          # kept for an on-demand --full (1 day)
+                self.call("DELETE", f"/repos/{self.repo}/actions/artifacts/{a['id']}", ok=(204, 404), what="artifact delete")
             tag = tag or state().get("tag")
-            if tag: self.delete_release(tag)
+            if tag and tag != CACHE_TAG: self.delete_release(tag)
             out["cleaned"] = True
         return out
 
@@ -308,6 +381,7 @@ def main(argv=None, gh=None):
     p = sp.add_parser("run"); p.add_argument("tag"); p.add_argument("reels")
     p = sp.add_parser("wait"); p.add_argument("--run-id"); p.add_argument("--timeout", type=int, default=3 * 3600); p.add_argument("--interval", type=int, default=30)
     p = sp.add_parser("fetch"); p.add_argument("outdir"); p.add_argument("--run-id"); p.add_argument("--tag"); p.add_argument("--keep", action="store_true")
+    p.add_argument("--full", action="store_true", help="also download the full videos already handed off to Social Lamma")
     p = sp.add_parser("delete"); p.add_argument("tag")
     a = ap.parse_args(argv)
     try:
@@ -316,7 +390,8 @@ def main(argv=None, gh=None):
             r = g.check(); print(f"OK repo {r['repo']} (branch {r['default_branch']}), permissions: {r['permissions']}"); return 0
         if a.cmd == "upload":
             r = g.upload(a.bundle_dir, a.tag, progress=lambda n, pc: print(f"upload {n} {pc}%", flush=True) if pc % 10 == 0 else None)
-            print(f"uploaded {len(r['uploaded'])}, already there {len(r['skipped'])} -> release {a.tag}"); return 0
+            print(f"uploaded {len(r['uploaded'])}, already there {len(r['skipped'])} -> release {a.tag}; source cache: uploaded {len(r.get('cache_uploaded') or [])}, "
+                  f"already on GitHub {len(r.get('cache_skipped') or [])}"); return 0
         if a.cmd == "run":
             r = g.dispatch(a.tag, a.reels); print(f"run {r['run_id']}: {r['url']}"); return 0
         rid = getattr(a, "run_id", None) or state().get("run_id")
@@ -327,8 +402,10 @@ def main(argv=None, gh=None):
             print("conclusion:", s["conclusion"]); return 0 if s["conclusion"] == "success" else 1
         if a.cmd == "fetch":
             if not rid: print("no run id"); return 1
-            r = g.fetch(rid, a.outdir, a.tag, a.keep)
-            print(f"{len(r['got'])} encrypted outputs in {a.outdir}" + (f"; MISSING: {','.join(r['missing'])}" if r["missing"] else "")); return 0 if r["got"] else 1
+            r = g.fetch(rid, a.outdir, a.tag, a.keep, full=a.full)
+            print(f"{len(r['got'])} encrypted outputs in {a.outdir}" + (f", {len(r['full'])} full videos" if r["full"] else "")
+                  + (f"; MISSING: {','.join(r['missing'])}" if r["missing"] else "")
+                  + (f"; full videos left on GitHub for 1 day (fetch --full): {','.join(r['full_available'])}" if r["full_available"] else "")); return 0 if (r["got"] or r["full"]) else 1
         if a.cmd == "delete":
             print("deleted" if g.delete_release(a.tag) else "no such release"); return 0
     except GHError as e:

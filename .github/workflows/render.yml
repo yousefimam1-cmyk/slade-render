@@ -2,6 +2,10 @@ name: render
 
 # Public repo: every input is an encrypted release asset, every output an encrypted artifact (1 day).
 # Plaintext media / plans / captions / full logs only exist inside the runner's temp dir.
+# Speed: source media come once into the long-lived release "src-cache" (content-addressed, encrypted; bundle/media.json points to them).
+# With the repo secret SOCIAL_LAMMA_TOKEN, a QA-PASS reel / joined YouTube video is uploaded straight to Social Lamma from the runner:
+#   artifact render-<id> = small (sidecars + previews + handoff.json with the media id, all encrypted), full-<id> = the video (only on request).
+# Without the secret everything stays as before (the join job does nothing, render-<id> carries the video).
 on:
   workflow_dispatch:
     inputs:
@@ -27,6 +31,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       reels: ${{ steps.m.outputs.reels }}
+      vids: ${{ steps.m.outputs.vids }}
     steps:
       - id: m
         env:
@@ -38,10 +43,13 @@ jobs:
           import json, os, re, sys
           ids = [x.strip() for x in os.environ["REELS"].split(",") if x.strip()]
           if not ids or not all(re.fullmatch(r"[A-Za-z0-9_-]{1,40}", x) for x in ids): sys.exit("bad reels input")
-          print(json.dumps(list(dict.fromkeys(ids))))
+          ids = list(dict.fromkeys(ids))
+          vids = sorted({x[:-4] for x in ids if x.endswith("-aud") and "-" not in x[:-4]})
+          c = (",", ":"); print(json.dumps(ids, separators=c) + " " + json.dumps(vids, separators=c))
           EOF
           )
-          echo "reels=$json" >> "$GITHUB_OUTPUT"
+          echo "reels=${json% *}" >> "$GITHUB_OUTPUT"
+          echo "vids=${json##* }" >> "$GITHUB_OUTPUT"
           echo "matrix: $json"
 
   render:
@@ -141,11 +149,17 @@ jobs:
           gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D "$RUNNER_TEMP/in" -p "$REEL.tar.enc" -p code.tar.enc
           for f in "$RUNNER_TEMP"/in/*; do [ "$(head -c 8 "$f")" = "Salted__" ] || { echo "not encrypted: $(basename "$f")"; exit 1; }; done
 
-      - name: decrypt, assemble, render, encrypt
+      - name: decrypt, assemble, render, QA, hand-off, encrypt
         env:
           RENDER_KEY: ${{ secrets.RENDER_KEY }}
+          SOCIAL_LAMMA_TOKEN: ${{ secrets.SOCIAL_LAMMA_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          SRC_CACHE_TAG: src-cache
           REEL: ${{ matrix.reel }}
-        run: bash cloud/job.sh "$REEL" "$RUNNER_TEMP/in" "$RUNNER_TEMP/out"
+        run: |
+          # YouTube parts are handed off by the join job (whole video), not one by one
+          if [[ "$REEL" =~ -(aud|c[0-9]+)$ ]]; then unset SOCIAL_LAMMA_TOKEN; fi
+          bash cloud/job.sh "$REEL" "$RUNNER_TEMP/in" "$RUNNER_TEMP/out"
 
       - name: upload encrypted output (1 day)
         if: always()
@@ -155,4 +169,105 @@ jobs:
           path: ${{ runner.temp }}/out/*.out.tar.enc
           retention-days: 1
           if-no-files-found: error
+          compression-level: 0
+
+      - name: upload encrypted full video (1 day, downloaded only on request)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-${{ matrix.reel }}
+          path: ${{ runner.temp }}/out/*.full.tar.enc
+          retention-days: 1
+          if-no-files-found: ignore
+          compression-level: 0
+
+  join:
+    needs: [setup, render]
+    if: ${{ !cancelled() && needs.setup.outputs.vids != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        vid: ${{ fromJSON(needs.setup.outputs.vids) }}
+    name: join (${{ matrix.vid }})
+    env:
+      FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+      FF_DIR: ${{ github.workspace }}/.cache/ffmpeg
+    steps:
+      - name: hand-off on?
+        id: on
+        env:
+          T: ${{ secrets.SOCIAL_LAMMA_TOKEN }}
+        run: if [ -n "$T" ]; then echo "on=1" >> "$GITHUB_OUTPUT"; else echo "JOIN SKIP ${{ matrix.vid }} reason=no_token (the PC joins the parts as before)"; fi
+
+      - uses: actions/checkout@v4
+        if: steps.on.outputs.on == '1'
+
+      - name: cache week
+        if: steps.on.outputs.on == '1'
+        id: wk
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: cache ffmpeg
+        if: steps.on.outputs.on == '1'
+        id: ffc
+        uses: actions/cache@v4
+        with:
+          path: .cache/ffmpeg
+          key: ffmpeg-btbn-master-gpl-${{ steps.wk.outputs.week }}
+
+      - name: static ffmpeg
+        if: steps.on.outputs.on == '1' && steps.ffc.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$FF_DIR"
+          curl -fsSL --retry 3 "$FFMPEG_URL" | tar -xJ -C "$FF_DIR" --strip-components=2 --wildcards '*/bin/ffmpeg' '*/bin/ffprobe'
+
+      - name: ffmpeg on PATH
+        if: steps.on.outputs.on == '1'
+        run: echo "$FF_DIR" >> "$GITHUB_PATH"
+
+      - name: part outputs (artifacts, inside GitHub)
+        if: steps.on.outputs.on == '1'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: render-${{ matrix.vid }}-*
+          path: ${{ runner.temp }}/parts
+          merge-multiple: true
+
+      - name: code bundle
+        if: steps.on.outputs.on == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.bundle_tag }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/code"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D "$RUNNER_TEMP/code" -p code.tar.enc
+
+      - name: join, QA, hand-off, encrypt
+        if: steps.on.outputs.on == '1'
+        env:
+          RENDER_KEY: ${{ secrets.RENDER_KEY }}
+          SOCIAL_LAMMA_TOKEN: ${{ secrets.SOCIAL_LAMMA_TOKEN }}
+          VID: ${{ matrix.vid }}
+        run: bash cloud/yt_join_job.sh "$VID" "$RUNNER_TEMP/parts" "$RUNNER_TEMP/code/code.tar.enc" "$RUNNER_TEMP/out"
+
+      - name: upload encrypted joined output (1 day)
+        if: steps.on.outputs.on == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-${{ matrix.vid }}
+          path: ${{ runner.temp }}/out/*.out.tar.enc
+          retention-days: 1
+          if-no-files-found: ignore
+          compression-level: 0
+
+      - name: upload encrypted full video (1 day, downloaded only on request)
+        if: steps.on.outputs.on == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-${{ matrix.vid }}
+          path: ${{ runner.temp }}/out/*.full.tar.enc
+          retention-days: 1
+          if-no-files-found: ignore
           compression-level: 0

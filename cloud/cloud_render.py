@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Run the PC's farm_pro.py (snapshot from code.tar.enc, not a fork) on one reel's bundle, cloud settings:
-final encode libx264 -preset veryfast -crf 20 (mezzanine/preview untouched), threads = vCPUs, memory guards sized for a runner.
+final encode libx264 -preset slow -crf 22 (quality-targeted; mezzanine/preview untouched), threads = vCPUs, memory guards sized for a runner.
 
   cloud_render.py --code DIR --bundle DIR --reel ID --out DIR
 """
 import os, sys, argparse
 
 ap = argparse.ArgumentParser(); ap.add_argument("--code", required=True); ap.add_argument("--bundle", required=True)
-ap.add_argument("--reel", required=True); ap.add_argument("--out", required=True); ap.add_argument("--crf", default="20"); ap.add_argument("--preset", default="veryfast")
+ap.add_argument("--reel", required=True); ap.add_argument("--out", required=True); ap.add_argument("--crf", default="22"); ap.add_argument("--preset", default="slow")
 a = ap.parse_args()
 sys.path.insert(0, os.path.abspath(a.code))
 import farm_pro as fp

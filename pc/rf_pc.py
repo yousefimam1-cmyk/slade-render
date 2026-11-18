@@ -5,16 +5,23 @@
   rf_pc.py ytbundle --plan pro_plan_v5.json --vids y1,y2 [--segs DIR]
                                                    YouTube: one bundle per part (<vid>-aud = audio track + sidecars, <vid>-cNN = video chunk)
                                                    -> <segs>\\<vid>-<part>.tar.enc + code.tar.enc + yt_parts.txt (the id list for the cloud run)
-  rf_pc.py decrypt [--in DIR] [--out DIR]          <in>\\*.out.tar.enc -> reels folder (mp4 + caption.txt + srt), YouTube parts -> youtube\\<vid>\\
+  rf_pc.py decrypt [--in DIR] [--out DIR] [--yt-out DIR]  <in>\\*.out.tar.enc -> reels folder (mp4 + caption.txt + srt), YouTube parts -> youtube\\<vid>\\
                                                    (joined into youtube\\<vid>.mp4 as soon as every part of a video is there), logs\\
   rf_pc.py check                                   key present? which cipher backend?
+  bundle / ytbundle [--cache DIR] [--no-cache]     upload-once source cache (default ON): every media file >= 1 MB (pieces, memes, ProPack clips)
+                                                   leaves the bundle and goes ONCE to <cache>\\f-<hmac>.enc (encrypted, name = HMAC(RENDER_KEY, content
+                                                   sha256): reveals nothing); the bundle keeps a media.json pointing to it and <cache>\\index\\<id>.txt
+                                                   lists the assets rf_cloud_pc.py upload must make sure are on the "src-cache" release.
+                                                   A re-render of the same footage then uploads only the small plan bundles. Default <cache> = <segs>\\cache
+  decrypt                                          small outputs (runner hand-off): <id>.handoff.json (Social Lamma media id) + qa.jpg/thumb.jpg/preview.mp4
+                                                   instead of the video; *.full.tar.enc (fetched with --full) bring the video itself
   rf_pc.py enc <in.tar> <out.enc> | dec <in.enc> <out.tar>   raw file primitives (tests)
 
 Format = `openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -salt -pass env:RENDER_KEY` ("Salted__"+salt, PBKDF2-HMAC-SHA256
 -> 32 B key + 16 B IV, PKCS#7). Backend: openssl.exe if it is OpenSSL >= 1.1.1, else Python `cryptography` (uv run --with cryptography).
 Tars are streamed straight into the cipher: no plaintext tar is ever written.
 """
-import os, re, io, sys, json, glob, shutil, tarfile, argparse, subprocess
+import os, re, io, sys, json, glob, hmac, shutil, hashlib, tarfile, argparse, subprocess
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ITER, MAGIC = 200000, b"Salted__"
@@ -153,16 +160,88 @@ def _put(src, dst):
     try: os.link(src, dst)
     except OSError: shutil.copy2(src, dst)
 
+# ---- upload-once source cache ----
+CACHE_MIN = 1 << 20
+CACHE_DIRS = ("pieces", "memes", "propack")
+
+class HashCache:
+    """sha256 of big files, remembered by (inode, size, mtime): hard-linked pieces are hashed once per stream, not once per bundle"""
+    def __init__(s, path):
+        s.path = path
+        try:
+            with open(path, encoding="utf-8") as f: s.d = json.load(f)
+        except (OSError, ValueError): s.d = {}
+        s.dirty = False
+    def sha(s, p):
+        st = os.stat(p); k = f"{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}" if st.st_ino else None
+        if k and k in s.d: return s.d[k]
+        h = hashlib.sha256()
+        with open(p, "rb") as f:
+            for b in iter(lambda: f.read(CHUNK), b""): h.update(b)
+        if k: s.d[k] = h.hexdigest(); s.dirty = True
+        return h.hexdigest()
+    def save(s):
+        if not s.dirty: return
+        with open(s.path + ".tmp", "w", encoding="utf-8") as f: json.dump(s.d, f)
+        os.replace(s.path + ".tmp", s.path); s.dirty = False
+
+def asset_name(sha):
+    """opaque, key-bound name: the same footage always maps to the same asset, but nobody without RENDER_KEY can link it to a file"""
+    return "f-" + hmac.new(key().encode("utf-8"), b"slade-media-v1:" + sha.encode(), hashlib.sha256).hexdigest()[:40] + ".enc"
+
+def cache_media(b, cache, rid, hc):
+    """move the big media of a staged bundle <b> into <cache> (encrypting each file once, ever) and write <b>/media.json + <cache>/index/<rid>.txt.
+    -> (n files, MB moved out of the bundle, MB newly encrypted)"""
+    os.makedirs(os.path.join(cache, "index"), exist_ok=True); idx = os.path.join(cache, "index", rid + ".txt")
+    files = []; moved = new = 0
+    for sub in CACHE_DIRS:
+        d = os.path.join(b, sub)
+        if not os.path.isdir(d): continue
+        for n in sorted(os.listdir(d)):
+            p = os.path.join(d, n)
+            if not os.path.isfile(p) or os.path.getsize(p) < CACHE_MIN: continue
+            sz = os.path.getsize(p); a = asset_name(hc.sha(p)); dst = os.path.join(cache, a)
+            if not os.path.isfile(dst):
+                enc_file(p, dst + ".part"); os.replace(dst + ".part", dst); new += sz
+            else: os.utime(dst)                                    # recently used: kept by the local prune
+            files.append({"path": f"{sub}/{n}", "asset": a, "size": sz}); moved += sz; os.remove(p)
+    hc.save()
+    if files:
+        json.dump({"v": 1, "files": files}, open(os.path.join(b, "media.json"), "w"), indent=1)
+        with open(idx, "w") as f: f.write("\n".join(sorted({x["asset"] for x in files})) + "\n")
+    elif os.path.exists(idx): os.remove(idx)
+    return len(files), moved / 2 ** 20, new / 2 ** 20
+
+def cache_prune(cache, days=14):
+    """local: drop cached assets no bundle index needs that were not used for <days> days"""
+    try: need = {l.strip() for f in glob.glob(os.path.join(cache, "index", "*.txt")) for l in open(f) if l.strip()}
+    except OSError: return
+    for f in glob.glob(os.path.join(cache, "f-*.enc")):
+        if os.path.basename(f) not in need and os.path.getmtime(f) < __import__("time").time() - days * 86400:
+            try: os.remove(f)
+            except OSError: pass
+
+def _cache_opts(a):
+    if getattr(a, "no_cache", False): return None
+    c = getattr(a, "cache", None) or os.path.join(a.segs, "cache"); os.makedirs(c, exist_ok=True)
+    return c, HashCache(os.path.join(c, "hashes.json"))
+
+def _drop_index(cache, rid):
+    if cache:
+        try: os.remove(os.path.join(cache, "index", rid + ".txt"))
+        except OSError: pass
+
 def cmd_bundle(a):
     segs = a.segs; ps = json.load(open(os.path.join(segs, "plan_segs.json"), encoding="utf-8")); key()
     want = [x.strip() for x in a.reels.split(",") if x.strip()] if a.reels else list(ps["reels"])
     pieces = os.path.join(segs, "pieces"); memes = os.path.join(segs, "assets", "memes"); ppd = os.path.join(segs, "assets", "propack")
     ppf = [os.path.join(r, f) for r, _, fs in os.walk(ppd) for f in fs] if os.path.isdir(ppd) else []
     stage = os.path.join(segs, "_stage"); shutil.rmtree(stage, ignore_errors=True)
-    print(f"cipher backend: {backend()}")
+    print(f"cipher backend: {backend()}"); co = _cache_opts(a)
     try:
         stage_code(a.scripts, stage, segs)
         for rid in want:
+            _drop_index(co and co[0], rid)
             R = ps["reels"][rid]; warn = []; b = os.path.join(stage, rid, "bundle")
             for d in ("pieces", "memes", "propack"): os.makedirs(os.path.join(b, d))
             for u in R["units"]:
@@ -184,11 +263,43 @@ def cmd_bundle(a):
                 if not hit: warn.append(f"clip {cn} missing")
             json.dump(R["plan"], open(os.path.join(b, "plan.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=1)
             json.dump(dict(units=R["units"], fill=ps["fill"]), open(os.path.join(b, "units.json"), "w"), indent=1)
+            cm = cache_media(b, co[0], rid, co[1]) if co else None
             out = encrypt_tree(os.path.join(stage, rid), "bundle", os.path.join(segs, rid + ".tar.enc"))
             shutil.rmtree(os.path.join(stage, rid), ignore_errors=True)
-            print(f"{rid}.tar.enc  {os.path.getsize(out) / 2 ** 20:.1f} MB" + "".join(f"\n  WARNING {x}" for x in warn))
+            print(f"{rid}.tar.enc  {os.path.getsize(out) / 2 ** 20:.1f} MB" + (f"  (+{cm[0]} cached media {cm[1]:.0f} MB, {cm[2]:.0f} MB new)" if cm and cm[0] else "")
+                  + "".join(f"\n  WARNING {x}" for x in warn))
     finally: shutil.rmtree(stage, ignore_errors=True)
+    if co: cache_prune(co[0])
     print(f"done: {len(want)} reels + code.tar.enc in {segs} (encrypted only: give these *.tar.enc to the agent)")
+
+def _cut_lead(src):
+    """stream-copy cuts (CUT_YT: -ss S -to E -c copy) start on the keyframe BEFORE S: the piece holds (S - lead .. E).
+    lead = piece video duration - (E - S); the renderer must read lead seconds further in (else captions/memes run early)"""
+    m = re.match(r"s(\d{8})_(\d{8})", os.path.basename(src))
+    if not m: return 0.0
+    want = (int(m.group(2)) - int(m.group(1))) / 1000
+    o = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=duration:format=duration", "-of", "csv=p=0", src], capture_output=True, text=True).stdout
+    ds = [float(x) for x in re.findall(r"\d+\.\d+", o)]
+    if not ds: return 0.0
+    lead = ds[0] - want
+    return round(lead, 3) if 0.02 < lead < 12 else 0.0
+
+def _keyframe_at_or_before(src, t):
+    """pts of the last video keyframe <= t (stream-copy cuts must start on one)"""
+    lo = max(0.0, t - 12)
+    o = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey", "-show_entries", "frame=pts_time",
+                        "-read_intervals", f"{lo:.3f}%{t + 0.01:.3f}", "-of", "csv=p=0", src], capture_output=True, text=True).stdout
+    ks = [float(x) for x in re.findall(r"[\d.]+", o) if float(x) <= t + 1e-3]
+    return max(ks) if ks else 0.0
+
+def _put_trim(src, dst, a, b):
+    """copy only [a, b] local seconds of a piece (stream copy, starts on a keyframe) -> seconds trimmed off the head, or None if not worth it"""
+    dur = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", src], capture_output=True, text=True).stdout.strip() or 0)
+    k = _keyframe_at_or_before(src, max(0.0, a))
+    if dur <= 0 or (min(dur, b) - k) > 0.7 * dur: _put(src, dst); return None
+    r = subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-ss", f"{k:.3f}", "-i", src, "-t", f"{b - k:.3f}", "-map", "0", "-c", "copy", dst])
+    if r.returncode or not os.path.isfile(dst): _put(src, dst); return None
+    return k
 
 def _extract_audio(src, dst):
     """audio-only copy of a piece (both tracks, stream copy) for the YouTube audio part: a fraction of the upload"""
@@ -205,22 +316,36 @@ def cmd_ytbundle(a):
     ppf = [os.path.join(r, f) for r, _, fs in os.walk(ppd) for f in fs] if os.path.isdir(ppd) else []
     yplan = {k: v for k, v in plan.items() if k not in ("reels", "post_order")}
     stage = os.path.join(segs, "_stage_yt"); shutil.rmtree(stage, ignore_errors=True); ids = []
-    print(f"cipher backend: {backend()}")
+    print(f"cipher backend: {backend()}"); co = _cache_opts(a)
     try:
         stage_code(a.scripts, stage, segs)
         for vid in [v.strip() for v in a.vids.split(",") if v.strip()]:
             y = next((v for v in plan["youtube"] if v["id"] == vid), None)
             if not y: sys.exit(f"{vid} not in {a.plan}")
-            cp = Y.plan_chunks(y, P); want_m = {m["id"] for m in y.get("memes", []) if m.get("id")}; want_c = {m["clip"] for m in y.get("memes", []) if m.get("clip")}
+            cp = Y.plan_chunks(y, P); tl = Y.timeline(y, P); leads = {}; want_m = {m["id"] for m in y.get("memes", []) if m.get("id")}; want_c = {m["clip"] for m in y.get("memes", []) if m.get("clip")}
             parts = [dict(cp["aud"], part="aud")] + cp["chunks"]
             for pt in parts:
-                pid = f"{vid}-{pt['part']}"; b = os.path.join(stage, pid, "bundle"); warn = []
+                pid = f"{vid}-{pt['part']}"; b = os.path.join(stage, pid, "bundle"); warn = []; _drop_index(co and co[0], pid)
                 for d in ("pieces", "memes", "propack"): os.makedirs(os.path.join(b, d))
+                need = {}
+                if pt["part"] != "aud":   # only the seconds of each piece this chunk reads (+ margin) -> much smaller upload
+                    lo = pt["f0"] - 4 * Y.FPS
+                    for c in tl.c:
+                        if c["i"] < pt["i1"] and (c["i"] >= pt["i0"] or c["f0"] + c["n"] > lo):
+                            n_ = os.path.basename(c["file"]); a_, b_ = c["loc"] - 3, c["loc"] + (c["b"] - c["a"]) + 3
+                            na, nb = need.get(n_, (a_, b_)); need[n_] = (min(na, a_), max(nb, b_))
+                offs = {}
                 for n in pt["pieces"]:
                     src = os.path.join(pdir, n)
                     if not os.path.isfile(src): sys.exit(f"{pid}: missing piece {n} (run CUT_YT.bat)")
+                    if n not in leads: leads[n] = _cut_lead(src); print(f"  {n}: keyframe lead {leads[n]:.3f}s") if leads[n] else None
+                    ld = leads[n]; k = 0.0     # PIECE_OFFS = seconds to subtract from loc: trimmed head k minus the cut's keyframe lead
                     if pt["part"] == "aud": _extract_audio(src, os.path.join(b, "pieces", os.path.splitext(n)[0] + ".mka"))
+                    elif n in need and not a.full:
+                        k = _put_trim(src, os.path.join(b, "pieces", n), need[n][0] + ld, need[n][1] + ld) or 0.0
                     else: _put(src, os.path.join(b, "pieces", n))
+                    if abs(k - ld) > 1e-4: offs[n] = round(k - ld, 4)
+                if offs: json.dump(offs, open(os.path.join(b, "pieces", "offsets.json"), "w"))
                 if pt["part"] == "aud" and cp["aud"].get("thumb_piece"): _put(os.path.join(pdir, cp["aud"]["thumb_piece"]), os.path.join(b, "pieces", cp["aud"]["thumb_piece"]))
                 if os.path.isfile(os.path.join(memes, "manifest.json")): shutil.copy2(os.path.join(memes, "manifest.json"), os.path.join(b, "memes"))
                 for mid in want_m:
@@ -235,12 +360,18 @@ def cmd_ytbundle(a):
                            need_demucs=bool(pt["part"] == "aud" and y.get("discord_audio")))
                 json.dump(job, open(os.path.join(b, "job.json"), "w"), indent=1)
                 json.dump(yplan, open(os.path.join(b, "plan.json"), "w", encoding="utf-8"), ensure_ascii=False)
+                cm = cache_media(b, co[0], pid, co[1]) if co else None
                 out = encrypt_tree(os.path.join(stage, pid), "bundle", os.path.join(segs, pid + ".tar.enc"))
                 shutil.rmtree(os.path.join(stage, pid), ignore_errors=True); ids.append(pid)
-                print(f"{pid}.tar.enc  {os.path.getsize(out) / 2 ** 20:.1f} MB" + "".join(f"\n  WARNING {x}" for x in warn))
+                print(f"{pid}.tar.enc  {os.path.getsize(out) / 2 ** 20:.1f} MB" + (f"  (+{cm[0]} cached media {cm[1]:.0f} MB, {cm[2]:.0f} MB new)" if cm and cm[0] else "")
+                      + "".join(f"\n  WARNING {x}" for x in warn))
     finally: shutil.rmtree(stage, ignore_errors=True)
+    if co: cache_prune(co[0])
     open(os.path.join(segs, "yt_parts.txt"), "w").write(",".join(ids) + "\n")
     print(f"done: {len(ids)} parts + code.tar.enc in {segs}\ncloud ids (yt_parts.txt): {','.join(ids)}")
+
+YT_SIDE = (".srt", ".layout.json", ".chapters.txt", ".description.txt", ".thumbnail.png")
+YT_EXTRA = (".handoff.json", ".qa.json", ".qa.jpg", ".thumb.jpg", ".preview.mp4")      # made on the runner by the join job (hand-off mode)
 
 def cmd_decrypt(a):
     src = a.inp; out = a.out
@@ -250,22 +381,40 @@ def cmd_decrypt(a):
             stem = os.path.splitext(os.path.basename((ps.get("source") or "cloud").replace("\\", "/")))[0]
         except OSError: stem = "cloud"
         out = os.path.join(a.scripts, "scan", stem + ".pro", "reels")
-    os.makedirs(out, exist_ok=True); logs = os.path.join(src, "logs"); os.makedirs(logs, exist_ok=True); n = 0; yt_dirs = set()
-    for e in sorted(glob.glob(os.path.join(src, "*.out.tar.enc"))):
-        rid = os.path.basename(e)[:-len(".out.tar.enc")]; tmp = os.path.join(src, "_dec_" + rid)
+    os.makedirs(out, exist_ok=True); logs = os.path.join(src, "logs"); os.makedirs(logs, exist_ok=True); n = 0; yt_dirs = set(); joined = set()
+    # *.out.tar.enc = the normal (or small, handed-off) package; *.full.tar.enc = just the video of a handed-off reel/episode (rf_cloud_pc fetch --full)
+    encs = [(e, False) for e in sorted(glob.glob(os.path.join(src, "*.out.tar.enc")))] + [(e, True) for e in sorted(glob.glob(os.path.join(src, "*.full.tar.enc")))]
+    for e, full in encs:
+        rid = os.path.basename(e)[:-len(".full.tar.enc" if full else ".out.tar.enc")]; tmp = os.path.join(src, "_dec_" + rid + ("_full" if full else ""))
         shutil.rmtree(tmp, ignore_errors=True); decrypt_tree(e, tmp)
         for f in glob.glob(os.path.join(tmp, "reels", "*")):
             if os.path.isfile(f): shutil.copy2(f, out)
         ytf = [f for f in glob.glob(os.path.join(tmp, "yt", "*")) if os.path.isfile(f)]
-        if ytf:   # YouTube part: <vid>-aud (m4a + sidecars) or <vid>-cNN (video chunk)
-            vid = rid.split("-")[0]; yd = os.path.join(os.path.dirname(out), "youtube", vid); os.makedirs(yd, exist_ok=True)
+        if ytf:   # YouTube part: <vid>-aud (m4a + sidecars) or <vid>-cNN (video chunk); <vid> alone = joined on the runner
+            vid = rid.split("-")[0]; yd = os.path.join(getattr(a, "yt_out", None) or os.path.join(os.path.dirname(out), "youtube"), vid); os.makedirs(yd, exist_ok=True)
             for f in ytf: shutil.copy2(f, yd)
             yt_dirs.add((vid, yd))
+            if rid == vid: joined.add(vid)
+        if full: shutil.rmtree(tmp, ignore_errors=True); print(f"FULL {rid}"); continue
         if os.path.isfile(os.path.join(tmp, "render.log")): shutil.copy2(os.path.join(tmp, "render.log"), os.path.join(logs, rid + ".render.log"))
-        ok = os.path.isfile(os.path.join(tmp, "reels", rid + ".mp4")) or any(f.endswith((".mp4", ".m4a")) for f in ytf); shutil.rmtree(tmp, ignore_errors=True); n += ok
-        print(f"{'OK  ' if ok else 'FAIL'} {rid}" + ("" if ok else f"  (see {logs}\\{rid}.render.log)"))
-    for vid, yd in sorted(yt_dirs): yt_try_join(a.scripts, vid, yd)
+        handed = os.path.isfile(os.path.join(tmp, "reels", rid + ".handoff.json")) or os.path.isfile(os.path.join(tmp, "yt", rid + ".handoff.json"))
+        has_v = os.path.isfile(os.path.join(tmp, "reels", rid + ".mp4")) or any(f.endswith((".mp4", ".m4a")) and not f.endswith(".preview.mp4") for f in ytf)
+        ok = has_v or handed; shutil.rmtree(tmp, ignore_errors=True); n += ok
+        print(f"{'OK  ' if ok else 'FAIL'} {rid}" + (" (already on Social Lamma: small files only)" if handed and not has_v else "")
+              + ("" if ok else f"  (see {logs}\\{rid}.render.log)"))
+    for vid, yd in sorted(yt_dirs):
+        if vid in joined: yt_place(vid, yd)
+        else: yt_try_join(a.scripts, vid, yd)
     print(f"{n} parts/reels decrypted; reels -> {out}")
+
+def yt_place(vid, yd):
+    """joined on the runner: youtube/<vid>/<vid>.mp4 (if it came) + sidecars + hand-off files -> youtube/<vid>.* (no join on the PC)"""
+    up = os.path.dirname(yd)
+    if os.path.isfile(os.path.join(yd, vid + ".mp4")): os.replace(os.path.join(yd, vid + ".mp4"), os.path.join(up, vid + ".mp4"))
+    for ext in YT_SIDE + YT_EXTRA:
+        if os.path.isfile(os.path.join(yd, vid + ext)): shutil.copy2(os.path.join(yd, vid + ext), up)
+    v = os.path.isfile(os.path.join(up, vid + ".mp4")); h = os.path.isfile(os.path.join(up, vid + ".handoff.json"))
+    print(f"{vid}: joined in the cloud" + (" -> " + os.path.join(up, vid + ".mp4") if v else "") + (" (on Social Lamma, media id in " + vid + ".handoff.json)" if h else ""))
 
 def yt_try_join(scripts, vid, yd):
     """join <yd>/<vid>-cNN.mp4 + <vid>.m4a -> youtube/<vid>.mp4 (+ sidecars) once every part is there"""
@@ -276,7 +425,7 @@ def yt_try_join(scripts, vid, yd):
     if miss: print(f"{vid}: still missing {', '.join(miss)}"); return
     sys.path.insert(0, scripts); import yt_join
     final = os.path.join(os.path.dirname(yd), vid + ".mp4"); yt_join.join(yd, vid, final)
-    for ext in (".srt", ".layout.json", ".chapters.txt", ".description.txt", ".thumbnail.png"):
+    for ext in YT_SIDE:
         if os.path.isfile(os.path.join(yd, vid + ext)): shutil.copy2(os.path.join(yd, vid + ext), os.path.dirname(yd))
     print(f"{vid}: joined -> {final}")
 
@@ -285,10 +434,13 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter); sp = ap.add_subparsers(dest="cmd", required=True)
     segs = os.path.join(HERE, "scan", "agent", "segs")
     p = sp.add_parser("bundle"); p.add_argument("--segs", default=segs); p.add_argument("--reels"); p.add_argument("--scripts", default=HERE); p.set_defaults(f=cmd_bundle)
-    p = sp.add_parser("ytbundle"); p.add_argument("--plan", required=True); p.add_argument("--vids", required=True); p.add_argument("--segs", default=segs)
+    p.add_argument("--cache", help="source cache dir (default <segs>\\cache)"); p.add_argument("--no-cache", action="store_true", help="put every media file inside the bundles (old way)")
+    p = sp.add_parser("ytbundle"); p.add_argument("--plan", required=True); p.add_argument("--vids", required=True); p.add_argument("--segs", default=segs); p.add_argument("--full", action="store_true", help="upload whole pieces (no trimming)")
     p.add_argument("--scripts", default=HERE); p.set_defaults(f=cmd_ytbundle)
+    p.add_argument("--cache", help="source cache dir (default <segs>\\cache)"); p.add_argument("--no-cache", action="store_true", help="put every media file inside the bundles (old way)")
     p = sp.add_parser("decrypt"); p.add_argument("--in", dest="inp", default=os.path.join(HERE, "scan", "agent", "cloud_out")); p.add_argument("--out")
-    p.add_argument("--segs", default=segs); p.add_argument("--scripts", default=HERE); p.set_defaults(f=cmd_decrypt)
+    p.add_argument("--segs", default=segs); p.add_argument("--scripts", default=HERE); p.add_argument("--yt-out", help="YouTube parts -> <dir>\\<vid>\\, joined video -> <dir>\\<vid>.mp4 (default: <out>\\..\\youtube)")
+    p.set_defaults(f=cmd_decrypt)
     p = sp.add_parser("check"); p.set_defaults(f=lambda a: (key(), print(f"RENDER_KEY set, cipher backend {backend()}")) and 0)
     p = sp.add_parser("enc"); p.add_argument("src"); p.add_argument("out"); p.set_defaults(f=lambda a: enc_file(a.src, a.out))
     p = sp.add_parser("dec"); p.add_argument("src"); p.add_argument("out"); p.set_defaults(f=lambda a: dec_file(a.src, a.out))

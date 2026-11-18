@@ -85,3 +85,15 @@ It then compares the result with a direct farm_pro render of the full source (du
 ## New stream button (PC-side, no Claude, no `gh`)
 
 Slade Hub's "New stream" tab runs `pc/NEW_STREAM.bat` (`new_stream.py`): extract audio, transcribe (local, Scribe opt-in), clip + plan draft (`ns_plan.py`, follows `knowledge/SLADE_EDIT_RULES.md`), cut, encrypt, then **`pc/rf_cloud_pc.py`** (stdlib, GitHub REST) does what `farm_cloud.py` does with `gh`: release, asset upload, workflow dispatch, poll, artifact download, cleanup. One-time on the PC: `SET_RENDER_KEY.bat`, and `SET_GH_TOKEN.bat` with a **fine-grained token for this repo only** (Actions: read+write, Contents: read+write), stored as user env var `GH_RENDER_TOKEN`. `prep_segments.py` now honours `SEGS_OUT` / `SCRIPTS` env vars in the generated `CUT_SEGMENTS.bat` (per-stream folders) and no longer needs `farm_cloud.py` unless `--mode` is used. Tests: `python tests/test_new_stream.py`, `python tests/test_rf_cloud_pc.py`. Full notes: Hub README ("NEW STREAM -> CONTENT").
+
+## Speed (2026-11-18): less over the home connection
+
+- **Upload source once:** `rf_pc.py bundle/ytbundle` moves every media file >= 1 MB into `<segs>\cache\f-<hmac>.enc` (encrypted once; name =
+  HMAC(RENDER_KEY, content sha256), reveals nothing). `rf_cloud_pc.py upload` sends only missing ones to the long-lived release `src-cache`
+  (unused assets > 21 days pruned; fetch/delete never touch it). The runner restores them with `cloud/fetch_media.py`. `--no-cache` = old way.
+- **Quality-targeted encode:** x264 `-preset slow -crf 22` (was veryfast CRF 20): 1080p source SSIM 0.9908 vs 0.9890, PSNR 43.3 vs 42.3 dB, 12% smaller.
+  Override: `RF_PRESET/RF_CRF` (reels), `YT_PRESET/YT_CRF` (YouTube chunks).
+- **Direct hand-off (repo secret `SOCIAL_LAMMA_TOKEN`):** QA-PASS reels and each YouTube video (new `join` job, `yt_join.py` on GitHub) go straight
+  from the runner to Social Lamma (`cloud/handoff.py`, media upload only). `render-<id>` then holds sidecars + qa/thumb/preview + `<id>.handoff.json`
+  (media id), encrypted; the video is in `full-<id>` (1 day), fetched only with `--full`. No secret / QA FAIL / error -> the old package.
+- Tests: `python3 -m unittest cloud/test_speed.py`, `python3 tests/test_speed_pc.py`, dry run vs fake services `python3 tests/speed_e2e.py /tmp/e2e pc`.

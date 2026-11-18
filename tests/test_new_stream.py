@@ -1,9 +1,11 @@
 """Unit tests for the New stream chain: state machine (new_stream.run_chain), the steps with fake tools + a fake GitHub, ns_plan, ns_post.
 No Windows, no network, no ffmpeg, no PC files touched. Run: python tests_newstream.py"""
-import json, os, shutil, sys, tempfile, time, unittest
+import json, os, re, shutil, sys, tempfile, time, unittest
+os.environ["CF_AI_OFF"] = "1"                 # tests never call the 70B (rules-only text)
 _H = os.path.dirname(os.path.abspath(__file__))
 for _d in (_H, os.path.join(_H, "..", "pc"), os.path.join(_H, "..")): sys.path.insert(0, _d)      # Scripts\\ on the PC, repo tests\\ in the repo
 import new_stream as N, ns_plan as P, ns_post, prep_segments
+P.SILENT_MAX, P.MIN_WORDS = 1e9, 0          # fixture stream has only 7 words; the talk rule has its own test
 
 
 def touch(p, data=b"x" * 2000):
@@ -30,7 +32,7 @@ class Engine(unittest.TestCase):
 
     def test_all_steps_run_in_order_and_state_is_saved(self):
         self.assertEqual(self.go(self.mk()), 0); self.assertEqual(self.calls, N.ORDER)
-        self.assertTrue(all(self.st.status(n) == "done" for n in N.ORDER)); self.assertIn("STEP 3/10 Find clips and draft the plan", self.out)
+        self.assertTrue(all(self.st.status(n) == "done" for n in N.ORDER)); self.assertIn("STEP 3/11 Find clips and draft the plan", self.out)
         self.assertEqual(N.State(self.st.path).status("summary"), "done")        # persisted
     def test_done_steps_are_skipped_on_rerun(self):
         self.go(self.mk()); self.calls.clear(); self.assertEqual(self.go(self.mk()), 0); self.assertEqual(self.calls, [])
@@ -64,7 +66,7 @@ class Engine(unittest.TestCase):
         self.assertEqual(self.st.data.get("run_id"), 5)
     def test_start_from_step_and_force(self):
         self.go(self.mk()); self.calls.clear(); self.go(self.mk(), start="qa"); self.assertEqual(self.calls, [])
-        self.go(self.mk(), start="qa", force=["qa"]); self.assertEqual(self.calls, ["qa", "summary"])
+        self.go(self.mk(), start="qa", force=["qa"]); self.assertEqual(self.calls, ["qa", "summary", "post"])
     def test_corrupt_state_file_starts_clean(self):
         with open(self.st.path, "w") as f: f.write("{not json")
         self.assertEqual(N.State(self.st.path).status("audio"), "pending")
@@ -143,6 +145,7 @@ class Pipeline(unittest.TestCase):
                 for f in os.listdir(i):
                     if f.endswith(".out.tar.enc"):
                         r = f[:-len(".out.tar.enc")]; touch(os.path.join(o, r + ".mp4"), b"m" * 4000); touch(os.path.join(o, r + ".caption.txt"), ("caption of " + r).encode()); touch(os.path.join(o, r + ".srt"))
+                        if r in getattr(self, "qa", {}): touch(os.path.join(o, r + ".qa.json"), json.dumps(self.qa[r]).encode())
         elif label == "QA_SHEET.bat":
             mp4 = [a for a in argv if a.endswith(".mp4")][0].strip('"'); touch(os.path.splitext(mp4)[0] + ".qa.jpg")
         elif label == "ffmpeg": touch(argv[-1])
@@ -217,7 +220,18 @@ class Pipeline(unittest.TestCase):
     def test_cloud_failure_of_one_reel_is_reported_not_fatal(self):
         self.gh = FakeGH(drop=["r02"]); c = self.ctx(); self.assertEqual(self.go(c), 0)
         s = json.load(open(os.path.join(c.out_dir, "summary.json"), encoding="utf-8")); self.assertEqual(s["missing"], ["r02"]); self.assertEqual(s["reels"][1]["status"], "missing")
-        self.assertEqual(self.ran.count("QA_SHEET.bat"), 1)
+    def test_cloud_qa_fail_marks_reel_qa_fail_and_auto_post_skips_it(self):
+        self.qa = {"r01": {"id": "r01", "status": "FAIL", "codes": ["loop", "sync"], "warn": []}, "r02": {"id": "r02", "status": "PASS", "codes": [], "warn": ["meme_cut"]}}
+        c = self.ctx(); self.assertEqual(self.go(c), 0, "\n".join(self.logs[-15:]))
+        s = json.load(open(os.path.join(c.out_dir, "summary.json"), encoding="utf-8")); r1, r2 = s["reels"]
+        self.assertEqual((r1["status"], r1["cloud_qa"], r1["qa_codes"]), ("qa_fail", "FAIL", ["loop", "sync"]))
+        self.assertEqual((r2["status"], r2["cloud_qa"], r2["qa_warn"]), ("ok", "PASS", ["meme_cut"]))
+        self.assertTrue(any("cloud QA failed" in str(x) and "r01:loop,sync" in str(x) for x in self.logs))
+        self.assertEqual([i["id"] for i in ns_post.build_plan(s)["items"]], ["r02"])
+    def test_no_cloud_qa_file_keeps_ok(self):
+        c = self.ctx(); self.go(c); s = json.load(open(os.path.join(c.out_dir, "summary.json"), encoding="utf-8"))
+        self.assertTrue(all(r["status"] == "ok" and r["cloud_qa"] == "none" for r in s["reels"]))
+        self.assertEqual(self.ran.count("QA_SHEET.bat"), len(s["reels"]))
     def test_github_error_is_a_readable_failed_step_and_resumable(self):
         self.gh.fail = "token rejected: run SET_GH_TOKEN.bat"; c = self.ctx(); self.assertEqual(self.go(c), 1); self.assertIn("SET_GH_TOKEN.bat", c.st.step("upload")["error"])
         self.gh.fail = None; self.ran.clear(); self.assertEqual(self.go(self.ctx()), 0); self.assertNotIn("rf_pc bundle", self.ran)               # encrypt is not redone
@@ -261,6 +275,33 @@ class Plan(unittest.TestCase):
         r = P.reel_from({"rank": 1, "start": 10, "dur": 300}, "r01", [], None, "TFT"); self.assertEqual(r["out"] - r["in"], P.REEL_MAX)
     def test_rules_info_requires_the_file(self):
         with self.assertRaises(FileNotFoundError): P.rules_info(tempfile.mkdtemp())
+
+
+class TalkRule(unittest.TestCase):
+    def test_silent_reels_and_series_name_hooks_are_dropped(self):
+        old = P.SILENT_MAX, P.MIN_WORDS; P.SILENT_MAX, P.MIN_WORDS = 10.0, 6
+        try:
+            busy = [(100 + i * 1.5, 100.8 + i * 1.5, "كلمة") for i in range(14)]
+            self.assertTrue(P.talk_ok(busy, 100, 120)[0])
+            gap = busy[:3] + [(115.0, 115.5, "x"), (116.0, 116.4, "y"), (117, 117.4, "z"), (118, 118.4, "w")]
+            ok, why = P.talk_ok(gap, 100, 120); self.assertFalse(ok); self.assertIn("nobody talking", why)
+            self.assertFalse(P.talk_ok(busy[:3], 100, 105)[0])
+        finally: P.SILENT_MAX, P.MIN_WORDS = old
+        self.assertTrue(P.NOT_STREAM_HOOK.search("جيم قوي في تلاتين ثانية")); self.assertFalse(P.NOT_STREAM_HOOK.search("افليوس 3 يخسر في الـ carousel"))
+
+
+class CloudQA(unittest.TestCase):
+    def setUp(self): self.d = tempfile.mkdtemp()
+    def tearDown(self): shutil.rmtree(self.d, ignore_errors=True)
+    def w(self, data):
+        p = os.path.join(self.d, "r.qa.json"); touch(p, data if isinstance(data, bytes) else json.dumps(data).encode()); return p
+    def test_parse_fail_pass_and_bad_files(self):
+        self.assertEqual(N.read_cloud_qa(self.w({"status": "FAIL", "codes": ["black"], "warn": ["qa_error"]})), ("FAIL", ["black"], ["qa_error"]))
+        self.assertEqual(N.read_cloud_qa(self.w({"status": "PASS", "codes": []})), ("PASS", [], []))
+        self.assertEqual(N.read_cloud_qa(self.w({"status": "FAIL", "codes": []}))[0], "PASS")      # FAIL without a code is not trusted
+        self.assertEqual(N.read_cloud_qa(self.w(b"{not json")), ("none", [], []))
+        self.assertEqual(N.read_cloud_qa(self.w({"status": "weird"})), ("none", [], []))
+        self.assertEqual(N.read_cloud_qa(os.path.join(self.d, "nope.qa.json")), ("none", [], []))
 
 
 class Post(unittest.TestCase):
@@ -310,6 +351,124 @@ class Bats(unittest.TestCase):
             b = open(os.path.join(here, f), "rb").read(); self.assertTrue(b.count(b"\r\n") == b.count(b"\n"), f + " must be CRLF")
         ps = open(os.path.join(here, "set_gh_token.ps1"), encoding="utf-8").read()
         self.assertNotRegex(ps, r"Write-(Output|Host)[^\n]*\$k\b"); self.assertIn("GH_RENDER_TOKEN", ps)
+
+
+# ---------------------------------------------------------------- YouTube episodes (no Claude)
+class YouTubeRealData(unittest.TestCase):
+    """the real 13 Nov stream (Scripts\\scan): 2 games, talk never sped up, valid chapters, memes never cut"""
+    STEM = "2026-11-13 23-20-41"
+    @classmethod
+    def setUpClass(cls):
+        scan = os.path.join(_H, "scan"); farm = os.path.join(scan, cls.STEM + ".farm")
+        cls.words = P.load_words(scan, cls.STEM)
+        if not cls.words or not os.path.isfile(os.path.join(farm, "ranked.json")): raise unittest.SkipTest("13 Nov transcript / ranked.json not on this machine")
+        cls.ranked = json.load(open(os.path.join(farm, "ranked.json"), encoding="utf-8-sig"))
+        cls.yt, cls.rep = P.build_youtube(cls.words, cls.ranked, os.path.join(farm, "edits"), "tft", "TFT Set 18", _H, None, cls.STEM, ai=False)
+    def test_two_games_found(self):
+        self.assertEqual(len(self.yt), 2, self.rep)
+        (a1, b1), (a2, b2) = [y["game_span"] for y in self.yt]
+        self.assertTrue(a1 < 1650 and 3700 < b1 < 3850, (a1, b1)); self.assertTrue(4200 < a2 < 4400 and 5950 < b2 < 6100, (a2, b2))       # game 1 = 1st, game 2 = 6th
+        self.assertTrue(any("skipped" in x["msg"] for x in self.rep))
+    def test_no_speech_inside_sped_up_segments(self):
+        for y in self.yt:
+            fast = [(s[0], s[1]) for s in y["segments"] if P.kof(s[2]) > 1]; self.assertTrue(fast)
+            for t0, t1, w in self.words:
+                for a, b in fast: self.assertFalse(t0 < b and t1 > a, f"{y['id']}: '{w}' {t0}-{t1} inside {a}-{b}")
+            for a, b in fast: self.assertLessEqual((b - a) / P.kof("x4"), 6.01)                     # one x4 burst <= 6 s on screen
+            segs = sorted(y["segments"]); self.assertTrue(all(segs[i][1] <= segs[i + 1][0] + 1e-6 for i in range(len(segs) - 1)), "repeated footage")
+    def test_chapters_valid(self):
+        for y in self.yt:
+            ch = y["chapters"]; T = P.out_time(y["segments"], y["segments"][-1][1])
+            self.assertGreaterEqual(len(ch), 3); self.assertEqual(ch[0]["t"], 0.0)
+            self.assertTrue(all(ch[i + 1]["t"] - ch[i]["t"] >= 10 for i in range(len(ch) - 1))); self.assertLess(ch[-1]["t"], T - 5)
+            names = [c["name"] for c in ch]; self.assertEqual(len(set(names)), len(names)); self.assertFalse(any("." in n for n in names))
+    def test_title_description_and_format(self):
+        for i, y in enumerate(self.yt):
+            self.assertRegex(y["title"], r"^TFT Set 18 \| .+ \| SLADE PLAYS TFT EP%d$" % (i + 1)); self.assertLessEqual(len(y["title"]), 100)
+            self.assertTrue(y["description"].startswith("#TFT #TeamfightTactics")); self.assertIn("Not endorsed by Riot Games", y["description"]); self.assertNotIn(".exe", y["description"] + y["title"])
+            for k in ("id", "segments", "memes", "shop", "chapters", "title", "description", "thumb", "subs", "bleep", "tags"): self.assertIn(k, y)
+            self.assertFalse(y["music"] or y["hud"] or y["phase_cards"])
+            self.assertTrue(any(s[0] <= y["thumb"]["src_t"] <= s[1] for s in y["segments"]))
+    def test_memes_play_in_full_and_pieces_cover_everything(self):
+        for y in self.yt:
+            for m in y["memes"]:
+                self.assertTrue(any(s[0] <= m["src_t"] and m["src_t"] + m["dur"] <= s[1] + 1e-6 and P.kof(s[2]) == 1 for s in y["segments"]) or
+                                any(s[0] <= m["src_t"] <= s[1] and P.kof(s[2]) == 1 for s in y["segments"]), m)
+            for a, b, _ in y["segments"]: self.assertTrue(any(p0 <= a and b <= p1 for p0, p1 in y["pieces"]))
+            self.assertTrue(all(y["game_span"][0] <= m["src_t"] < y["game_span"][1] for m in y["memes"]))
+    def test_farm_yt4_accepts_the_plan(self):
+        try: import farm_yt4 as Y
+        except Exception as e: self.skipTest(f"farm_yt4 deps: {e}")
+        for y in self.yt:
+            Pc = [(a, b, "s%08d_%08d.mp4" % (round(a * 1000), round(b * 1000))) for a, b in y["pieces"]]
+            cp = Y.plan_chunks(y, Pc); self.assertGreater(len(cp["chunks"]), 1); self.assertAlmostEqual(cp["T"], P.out_time(y["segments"], y["segments"][-1][1]), delta=5)
+
+
+class YouTubeUnits(unittest.TestCase):
+    def test_split_games_without_cues_uses_windows(self):
+        ws = [(float(t), t + 0.5, "كلام") for t in range(0, 6000, 3)]                 # 100 min of talk, no GG, no long silence
+        g = P.split_games(ws); self.assertEqual(len(g), 3); self.assertTrue(all(b - a <= P.YT_MAX_GAME + 5 for a, b in g))
+    def test_gg_before_a_short_silence_ends_the_game(self):
+        ws = [(float(t), t + 0.5, "x") for t in range(0, 600, 2)] + [(600.0, 600.5, "GG")] + [(float(t), t + 0.5, "y") for t in range(660, 1200, 2)]
+        self.assertEqual(len(P.split_games(ws)), 2)
+        ws2 = [(float(t), t + 0.5, "x") for t in range(0, 600, 2)] + [(float(t), t + 0.5, "y") for t in range(660, 1200, 2)]
+        self.assertEqual(len(P.split_games(ws2)), 1)
+    def test_episode_numbers_are_stable(self):
+        d = tempfile.mkdtemp(); f = os.path.join(d, "ep.json")
+        self.assertEqual([P.episode_no(f, k, "TFT") for k in ("a#1", "a#2", "a#1", "b#1")], [1, 2, 1, 3]); shutil.rmtree(d)
+    def test_rule_chapters_unique(self):
+        w = [{"words": ["roll"]}, {"words": ["roll"]}, {"words": []}, {"words": []}, {"words": []}, {"words": ["gg"]}]
+        n = P.rule_chapters(w); self.assertEqual(len(set(n)), len(n)); self.assertEqual(n[0], "البداية"); self.assertEqual(n[-1], "آخر fight")
+
+
+def _talk(a, b, step=1.0): return [("كلمة", float(t), float(t) + 0.6) for t in [a + i * step for i in range(int((b - a) / step))]]
+YT_WORDS = _talk(100, 400) + [("GG", 400.0, 400.4)] + _talk(1000, 1300)          # 2 games with 5 min of talk each, a 10 min queue between
+
+
+class PipelineYouTube(Pipeline):
+    """the same chain with YouTube on: parts bundled, rendered in the SAME cloud run as the reels, decrypted+joined, copied as '<game> EPn.mp4'"""
+    def runner(self, cmd, env=None, cwd=None, label=""):
+        argv = cmd if isinstance(cmd, list) else cmd.split()
+        if label == "TRANSCRIBE.bat":
+            self.ran.append(label); j = {"transcription": [{"offsets": {"from": 0, "to": 1}, "text": "x", "words": [{"w": w, "t0": a, "t1": b, "caption_ok": True} for w, a, b in WORDS + YT_WORDS]}]}
+            touch(os.path.join(self.sc, "scan", self.STEM + ".ens.json"), json.dumps(j).encode()); return 0
+        if label == "CUT_SEGMENTS.bat" and env["SEGS_OUT"].endswith("segs_yt"):
+            self.ran.append("YT_CUT"); self.yt_env = dict(env); touch(os.path.join(env["SEGS_OUT"], "pieces", "s00100000_00400000.mp4")); return 0
+        if label == "uv" and "ytbundle" in argv:
+            self.ran.append("rf_pc ytbundle"); self.yt_argv = list(argv); segs = argv[argv.index("--segs") + 1]; ids = []
+            for v in argv[argv.index("--vids") + 1].split(","):
+                for pt in ("aud", "c01", "c02"): touch(os.path.join(segs, f"{v}-{pt}.tar.enc"), b"Salted__" + b"y" * 300); ids.append(f"{v}-{pt}")
+            touch(os.path.join(segs, "code.tar.enc"), b"Salted__" + b"c" * 300); touch(os.path.join(segs, "yt_parts.txt"), ",".join(ids).encode()); return 0
+        rc = super().runner(cmd, env, cwd, label)
+        if label == "uv" and "decrypt" in argv:
+            i, yo = argv[argv.index("--in") + 1], argv[argv.index("--yt-out") + 1]
+            for f in os.listdir(i):
+                m = re.match(r"(y\d+)-aud\.out\.tar\.enc$", f)
+                if m and all(os.path.isfile(os.path.join(i, f"{m.group(1)}-{p}.out.tar.enc")) for p in ("c01", "c02")):
+                    v = m.group(1); touch(os.path.join(yo, v + ".mp4"), b"Y" * 5000)
+                    touch(os.path.join(yo, v + ".description.txt"), b"desc"); touch(os.path.join(yo, v + ".chapters.txt"), b"0:00 x")
+        return rc
+
+    def test_youtube_episodes_ride_along_with_the_reels(self):
+        c = self.ctx(); self.assertEqual(self.go(c), 0, "\n".join(self.logs[-15:]))
+        plan = json.load(open(c.plan_path, encoding="utf-8")); self.assertEqual([y["id"] for y in plan["youtube"]], ["y1", "y2"])
+        self.assertEqual([y["out_name"] for y in plan["youtube"]], ["TFT EP1", "TFT EP2"])
+        self.assertEqual(self.gh.calls.count("dispatch"), 1); self.assertEqual(self.gh.reels[:2], ["r01", "r02"]); self.assertIn("y1-aud", self.gh.reels); self.assertIn("y2-c02", self.gh.reels)
+        for x in ("--with", "numpy", "pillow", "python-bidi"): self.assertIn(x, self.yt_argv)
+        self.assertEqual(self.yt_env["SEGS_OUT"], c.segs_yt); bat = open(os.path.join(c.segs_yt, "CUT_SEGMENTS.bat"), encoding="utf-8").read(); self.assertIn("-avoid_negative_ts make_zero", bat)
+        for n in ("TFT EP1.mp4", "TFT EP1.description.txt", "TFT EP1.chapters.txt", "TFT EP1.title.txt", "TFT EP2.mp4"): self.assertTrue(os.path.isfile(os.path.join(c.out_dir, n)), n)
+        s = json.load(open(os.path.join(c.out_dir, "summary.json"), encoding="utf-8")); self.assertEqual([y["status"] for y in s["youtube"]], ["ok", "ok"]); self.assertEqual(s["yt_missing"], [])
+        self.ran.clear(); self.gh.calls.clear(); self.assertEqual(self.go(self.ctx()), 0); self.assertEqual(self.ran, []); self.assertEqual(self.gh.calls, [])     # resumable: nothing redone
+    def test_one_failed_youtube_part_is_reported_not_fatal(self):
+        self.gh = FakeGH(drop=["y2-c01"]); c = self.ctx(); self.assertEqual(self.go(c), 0)
+        s = json.load(open(os.path.join(c.out_dir, "summary.json"), encoding="utf-8")); self.assertEqual(s["yt_missing"], ["y2"]); self.assertEqual(s["youtube"][0]["status"], "ok")
+    def test_no_youtube_flag_means_reels_only(self):
+        c = self.ctx(youtube=False); self.assertEqual(self.go(c), 0); self.assertEqual(json.load(open(c.plan_path, encoding="utf-8"))["youtube"], [])
+        self.assertNotIn("rf_pc ytbundle", self.ran); self.assertEqual(self.gh.reels, ["r01", "r02"])
+    def test_main_defaults_to_youtube_on(self):
+        import argparse
+        self.assertIn("--no-youtube", open(N.__file__, encoding="utf-8").read()); self.assertTrue(N.Ctx(self.video, self.sc, self.vid).youtube)
+for _n in [n for n in vars(Pipeline) if n.startswith("test_")]: setattr(PipelineYouTube, _n, None)      # only the YouTube tests run here
 
 
 if __name__ == "__main__": unittest.main(verbosity=1)
