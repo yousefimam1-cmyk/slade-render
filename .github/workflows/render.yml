@@ -77,6 +77,13 @@ jobs:
           path: ~/.cache/torch
           key: torch-hub-htdemucs-v1
 
+      - name: cache whisper small (render QA caption sync)
+        if: ${{ !contains(matrix.reel, '-c') }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-faster-whisper-small-v1
+
       - name: cache week
         id: wk
         run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"

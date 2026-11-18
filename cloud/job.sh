@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # One reel (or one YouTube part, e.g. y1-aud / y1-c03), one runner:  job.sh <id> <dir with ID.tar.enc + code.tar.enc> <outdir>
-# env RENDER_KEY (repo secret). Writes <outdir>/<reel>.out.tar.enc = reels/<reel>.mp4 + .caption.txt + .srt + render.log.
+# env RENDER_KEY (repo secret). Writes <outdir>/<reel>.out.tar.enc = reels/<reel>.mp4 + .caption.txt + .srt + render.log
+# + qa.json / <reels|yt>/<id>.qa.json from qa_media.py (public log: one "QA PASS|FAIL <id> codes=..." line, codes only).
 # The public log only shows progress lines; the full log (it can contain transcript text) travels encrypted.
 set -euo pipefail
 REEL="$1"; IN="$(cd "$2" && pwd)"; OUT="$3"; HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -12,6 +13,12 @@ OSSL=(openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass env:RENDER_
 mkdir -p "$OUT"; OUT="$(cd "$OUT" && pwd)"
 W="$(mktemp -d)"; trap 'rm -rf "$W"' EXIT
 dec() { "${OSSL[@]}" -d -in "$1" | tar -C "$2" --no-same-owner -xf -; }
+# automatic QA (black / loop / caption sync / memes): never breaks the render, public line = codes only
+qa() {
+  timeout 1500 python3 "$HERE/qa_media.py" --id "$REEL" --pkg "$W/pkg" >"$W/pkg/qa.log" 2>&1 || true
+  grep -E '^QA (PASS|FAIL) [A-Za-z0-9_-]+( codes=[a-z_,]+)?( warn=[a-z_,]+)?$' "$W/pkg/qa.line" 2>/dev/null || echo "QA PASS $REEL warn=qa_error"
+  rm -f "$W/pkg/qa.line"
+}
 
 dec "$IN/code.tar.enc" "$W"
 dec "$IN/$REEL.tar.enc" "$W"
@@ -31,6 +38,7 @@ if [ -f "$W/bundle/job.json" ]; then
   } >"$LOG" 2>&1 || rc=$?
   grep -E '^(STEP |OK  |FAIL |reel [A-Za-z0-9_-]+ \|)' "$LOG" || true
   ls "$W/pkg/yt" | grep -qE '\.(mp4|m4a)$' || { [ $rc -ne 0 ] || rc=1; echo "no part produced (full log is in the encrypted output)"; }
+  qa
   tar -C "$W/pkg" -cf - . | "${OSSL[@]}" -e -salt -out "$OUT/$REEL.out.tar.enc"
   echo "encrypted output: $REEL.out.tar.enc ($(du -h "$OUT/$REEL.out.tar.enc" | cut -f1)) rc=$rc"
   exit $rc
@@ -47,6 +55,7 @@ for f in "$W/render/reels/$REEL".mp4 "$W/render/reels/$REEL".caption.txt "$W/ren
   [ -f "$f" ] && cp "$f" "$W/pkg/reels/"
 done
 [ -f "$W/pkg/reels/$REEL.mp4" ] || { [ $rc -ne 0 ] || rc=1; echo "no video produced (full log is in the encrypted output)"; }
+qa
 tar -C "$W/pkg" -cf - . | "${OSSL[@]}" -e -salt -out "$OUT/$REEL.out.tar.enc"
 echo "encrypted output: $REEL.out.tar.enc ($(du -h "$OUT/$REEL.out.tar.enc" | cut -f1)) rc=$rc"
 exit $rc

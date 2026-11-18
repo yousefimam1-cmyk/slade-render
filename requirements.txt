@@ -3,3 +3,4 @@ python-bidi
 fonttools
 pillow
 numpy
+faster-whisper
