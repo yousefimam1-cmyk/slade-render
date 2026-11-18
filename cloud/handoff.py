@@ -17,6 +17,7 @@ BASE = (os.environ.get("SOCIAL_LAMMA_BASE") or "https://social.lammaonline.websi
 BRAND = os.environ.get("SOCIAL_LAMMA_BRAND") or "slade"
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 PAR = int(os.environ.get("HANDOFF_PARALLEL", "4"))
+UA = "slade-render/1.0 (+github actions)"     # the site's edge refuses the default Python-urllib agent (403 on part PUTs)
 
 
 def norm_token(v):
@@ -45,7 +46,7 @@ class Client:
     def call(self, tool, args):
         self.n += 1
         body = json.dumps({"jsonrpc": "2.0", "id": self.n, "method": "tools/call", "params": {"name": tool, "arguments": args}}).encode()
-        hd = {"Authorization": "Bearer " + self.tok, "Content-Type": "application/json", "Accept": "application/json, text/event-stream", "User-Agent": "slade-render"}
+        hd = {"Authorization": "Bearer " + self.tok, "Content-Type": "application/json", "Accept": "application/json, text/event-stream", "User-Agent": UA}
         code, raw = 0, b""
         for tr in range(4):
             try: code, _, raw = self.t("POST", self.base + "/mcp", hd, body, 120)
@@ -98,7 +99,7 @@ def upload(client, path, filename=None, mime="video/mp4", parallel=PAR):
     if u.get("kind") == "put":
         with open(path, "rb") as f: data = f.read()
         for tr in range(5):
-            try: code, _, _ = t("PUT", u["url"], {"Content-Type": mime, "Content-Length": str(size)}, data, 1800)
+            try: code, _, _ = t("PUT", u["url"], {"Content-Type": mime, "Content-Length": str(size), "User-Agent": UA}, data, 1800)
             except (urllib.error.URLError, OSError): code = -1
             if 200 <= code < 300: return mid, 1
             client.sleep(2 * (tr + 1))
@@ -110,7 +111,7 @@ def upload(client, path, filename=None, mime="video/mp4", parallel=PAR):
         with open(path, "rb") as f: f.seek((n - 1) * ps); data = f.read(ps)
         url = u["partUrlTemplate"].replace("{partNumber}", str(n)).replace("{n}", str(n)); code = 0
         for tr in range(5):
-            try: code, hd, raw = t("PUT", url, {"Content-Type": "application/octet-stream", "Content-Length": str(len(data))}, data, 900)
+            try: code, hd, raw = t("PUT", url, {"Content-Type": "application/octet-stream", "Content-Length": str(len(data)), "User-Agent": UA}, data, 900)
             except (urllib.error.URLError, OSError): code, hd, raw = -1, {}, b""
             et = _etag(hd, raw)
             if 200 <= code < 300 and et: return n, et
