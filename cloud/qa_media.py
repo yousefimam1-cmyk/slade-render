@@ -38,11 +38,20 @@ def check_black(mp4, dur):
 
 # ---------------- b) loop ----------------
 def frames(mp4, max_frames=4000):
+    """gray frames (N,36,64) of the MOVING area only: a 9:16 reel is mostly a still background/caption band around a small
+    game strip, so hashing the whole frame makes different gameplay look identical (false loops). Crop to where pixels change."""
     import numpy as np
-    r = run(["ffmpeg", "-nostdin", "-v", "error", "-i", mp4, "-an", "-vf", f"fps={FPS},scale=64:36,format=gray",
+    W, H = 90, 160
+    r = run(["ffmpeg", "-nostdin", "-v", "error", "-i", mp4, "-an", "-vf", f"fps={FPS},scale={W}:{H},format=gray",
              "-frames:v", str(max_frames), "-f", "rawvideo", "-"], timeout=900)
     a = np.frombuffer(r.stdout, np.uint8)
-    return a[: len(a) // (64 * 36) * 64 * 36].reshape(-1, 36, 64)
+    a = a[: len(a) // (W * H) * W * H].reshape(-1, H, W).astype(np.float32)
+    if len(a) >= 4:
+        sd = a.std(axis=0); act = sd > max(6.0, float(np.percentile(sd, 60)))
+        rows, cols = np.where(act.any(1))[0], np.where(act.any(0))[0]
+        if len(rows) >= 8 and len(cols) >= 8: a = a[:, rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
+    ys = np.linspace(0, a.shape[1] - 1, 36).astype(int); xs = np.linspace(0, a.shape[2] - 1, 64).astype(int)
+    return a[:, ys][:, :, xs]
 
 def dhash(fr):
     """frames (N,36,64) -> uint64 hashes: 9x8 area means, bit = left < right"""
@@ -60,7 +69,15 @@ def ham(a, b):
     x = np.bitwise_xor(a, b)
     return _LUT[x.view(np.uint8)].reshape(x.shape + (8,)).sum(-1, dtype=np.uint16)
 
-def find_loops(h, fps=FPS):
+MAD_MAX = 1.5   # a real repeat is the same pixels re-encoded; different gameplay on a similar-looking board is far above this
+
+def _same_pixels(fr, a, b, L):
+    import numpy as np
+    if fr is None: return True
+    x = fr[a:a + L].astype(np.float32); y = fr[b:b + L].astype(np.float32)
+    return float(np.median(np.abs(x - y).mean(axis=(1, 2)))) <= MAD_MAX
+
+def find_loops(h, fps=FPS, fr=None):
     """runs of >=MIN_RUN frames that repeat an earlier run (>=MIN_GAP s back, hamming<=HAM per frame) while moving"""
     import numpy as np
     n = len(h); out = []; gap = int(round(MIN_GAP * fps))
@@ -76,7 +93,7 @@ def find_loops(h, fps=FPS):
             L = j - i
             if L >= MIN_RUN:
                 s = i + d; mv = step[s:s + L - 1]
-                if (mv > 0).mean() >= 0.75 and int(ham(h[s:s + 1], h[s + L - 1:s + L])[0]) > HAM:
+                if (mv > 0).mean() >= 0.75 and int(ham(h[s:s + 1], h[s + L - 1:s + L])[0]) > HAM and _same_pixels(fr, i, s, L):
                     out.append({"t": round(s / fps, 2), "src": round(i / fps, 2), "len": round(L / fps, 2)})
             i = j
     out.sort(key=lambda x: (-x["len"], x["t"])); keep = []
@@ -85,7 +102,7 @@ def find_loops(h, fps=FPS):
     return sorted(keep, key=lambda x: x["t"])[:10]
 
 def check_loop(mp4):
-    return find_loops(dhash(frames(mp4)))
+    fr = frames(mp4); return find_loops(dhash(fr), fr=fr)
 
 # ---------------- c) sync ----------------
 _DIAC = re.compile(r"[ؐ-ًؚ-ٰٟۖ-ۭـ]")
