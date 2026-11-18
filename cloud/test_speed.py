@@ -92,6 +92,10 @@ class Handoff(unittest.TestCase):
                            capture_output=True, text=True, env={k: v for k, v in os.environ.items() if k != "SOCIAL_LAMMA_TOKEN"})
         self.assertEqual((p.returncode, p.stdout.strip(), p.stderr), (3, "HANDOFF SKIP r01 reason=no_token", ""))
 
+    def test_connector_link_in_the_secret_is_reduced_to_the_token(self):
+        self.assertEqual(H.norm_token("https://social.example/mcp/" + "A" * 30 + "/"), "A" * 30)
+        self.assertEqual(H.norm_token("  plainTOKEN_123  "), "plainTOKEN_123")
+
     def test_part_upload_failure_is_a_fail_code(self):
         rc, line, rec = self.run_(FakeSocial(part=4096, fail={"part3": 99}))
         self.assertEqual((rc, line, rec), (1, "HANDOFF FAIL r01 code=part_http_500", None))

@@ -19,6 +19,12 @@ ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 PAR = int(os.environ.get("HANDOFF_PARALLEL", "4"))
 
 
+def norm_token(v):
+    """the secret may hold the whole connector link (https://.../mcp/<token>): use the token part"""
+    v = (v or "").strip(); m = re.search(r"/mcp/([A-Za-z0-9_-]{20,200})/?$", v)
+    return m.group(1) if m else v
+
+
 class HandoffError(Exception):
     def __init__(self, code): super().__init__(code); self.code = code
 
@@ -120,7 +126,7 @@ def upload(client, path, filename=None, mime="video/mp4", parallel=PAR):
 def handoff(path, rid, out, token=None, client=None, filename=None):
     """-> (exit code, public line). 0 ok, 1 fail, 3 skipped (no token / no file)."""
     rid = rid if ID_RE.match(rid or "") else "x"
-    tok = (token if token is not None else os.environ.get(TOKEN_VAR) or "").strip()
+    tok = norm_token(token if token is not None else os.environ.get(TOKEN_VAR))
     if not tok and client is None: return 3, f"HANDOFF SKIP {rid} reason=no_token"
     if not os.path.isfile(path) or os.path.getsize(path) < 1000: return 3, f"HANDOFF SKIP {rid} reason=no_video"
     try:
