@@ -4,9 +4,6 @@ name: selftest-direct-upload
 # as MEDIA ONLY, brand slade, never a post. Prints the test media ids. Run: gh workflow run selftest-direct-upload
 on:
   workflow_dispatch:
-  push:
-    branches: ["claude/direct-upload-default"]
-    paths: [".github/workflows/selftest.yml", "cloud/selftest.sh"]
 
 permissions:
   contents: read
