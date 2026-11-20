@@ -1,0 +1,54 @@
+name: drive-src
+
+# Drive stream -> encrypted release assets the PC can pull with its GitHub token (Drive files stay private, nothing is shared by link).
+# Start: push jobs/src/<stem>.json = {"file_id": "...", "stem": "..."} (one per commit).
+# Release tag: src-<stem>; assets: <stem>.part00.enc, part01.enc ... (1.9 GB pieces, RENDER_KEY, openssl Salted__ pbkdf2 200k sha256)
+#   + <stem>.wav.json.enc (cloud transcript from drive-out, if there) + <stem>.sha256 (of the joined plaintext mp4).
+# PC: gh release download src-<stem> -> decrypt each part -> copy /b part00+part01+... -> <stem>.mp4 -> check sha256.
+on:
+  push:
+    branches: [main]
+    paths: ["jobs/src/*.json"]
+
+permissions:
+  contents: write
+
+jobs:
+  src:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 2}
+      - id: j
+        run: |
+          set -euo pipefail
+          f=$(git diff --name-only --diff-filter=AM HEAD~1 HEAD -- 'jobs/src/*.json' | head -1)
+          python3 - "$f" <<'PY'
+          import json, re, sys, os
+          j = json.load(open(sys.argv[1])); fid, stem = j["file_id"], j["stem"]
+          assert re.fullmatch(r"[A-Za-z0-9_-]{10,100}", fid) and re.fullmatch(r"[A-Za-z0-9._+-]{1,100}", stem)
+          open(os.environ["GITHUB_OUTPUT"], "a").write(f"fid={fid}\nstem={stem}\n")
+          PY
+      - name: free disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; df -h "$RUNNER_TEMP" | tail -1
+      - name: download from Drive
+        env:
+          GDRIVE_SA_KEY: ${{ secrets.GDRIVE_SA_KEY }}
+          FID: ${{ steps.j.outputs.fid }}
+        run: pip install -q cryptography && python3 drive/drive_fetch.py get "$FID" "$RUNNER_TEMP/src.mp4"
+      - name: split + encrypt + release
+        env:
+          RENDER_KEY: ${{ secrets.RENDER_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          STEM: ${{ steps.j.outputs.stem }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"; mkdir -p up
+          sha256sum src.mp4 | cut -d' ' -f1 > "up/$STEM.sha256"
+          split -b 1900M -d -a 2 src.mp4 piece_ && rm src.mp4
+          for p in piece_*; do n=${p#piece_}; openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -salt -pass env:RENDER_KEY -in "$p" -out "up/$STEM.part$n.enc"; rm "$p"; done
+          git clone -q --depth 1 -b drive-out "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY" out 2>/dev/null && [ -f "out/$STEM/$STEM.wav.json.enc" ] && cp "out/$STEM/$STEM.wav.json.enc" up/ || true
+          TAG="src-$STEM"; gh release delete "$TAG" -R "$GITHUB_REPOSITORY" -y --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "$TAG" --notes "encrypted source pieces (RENDER_KEY); delete after the PC pulled them" up/*
+          ls -la up
