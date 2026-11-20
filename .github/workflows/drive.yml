@@ -186,8 +186,8 @@ jobs:
           set -euo pipefail
           pip install -q cryptography
           mkdir -p "$RUNNER_TEMP/tr"; cd "$RUNNER_TEMP/tr"
-          for f in $(ls tr_*.enc 2>/dev/null); do openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass env:RENDER_KEY -in "$f" -out "${f%.enc}.json"; rm "$f"; done
-          N=$(python3 -c "import json,os;print(len(json.loads(os.environ['PARTS'] or '[]')))"); HAVE=$(ls tr_*.json 2>/dev/null | wc -l)
+          for f in $(find . -maxdepth 1 -name 'tr_*.enc' -printf '%f\n'); do openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass env:RENDER_KEY -in "$f" -out "${f%.enc}.json"; rm "$f"; done
+          N=$(python3 -c "import json,os;print(len(json.loads(os.environ['PARTS'] or '[]')))"); HAVE=$(find . -maxdepth 1 -name 'tr_*.json' | wc -l)
           echo "parts $HAVE/$N"
           if [ "$HAVE" -gt 0 ]; then python3 "$GITHUB_WORKSPACE/drive/drive_fetch.py" words . "$RUNNER_TEMP/$STEM.wav.json"; else echo '{"transcription":[],"skipped":"no voice or buggy (see probe)"}' > "$RUNNER_TEMP/$STEM.wav.json"; fi
           cd "$RUNNER_TEMP"
