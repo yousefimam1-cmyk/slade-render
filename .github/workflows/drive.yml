@@ -25,6 +25,7 @@ jobs:
       parts: ${{ steps.p.outputs.parts }}
       cuts: ${{ steps.p.outputs.cuts }}
       game: ${{ steps.j.outputs.game }}
+      ok: ${{ steps.p.outputs.ok }}
     steps:
       - uses: actions/checkout@v4
         with: {fetch-depth: 2}
@@ -79,6 +80,12 @@ jobs:
           # his mic: track 2 (a:1) when the recorder split voice from game (OBS / SteelSeries), else the only track
           TR=0; [ "$NA" -ge 2 ] && TR=1
           echo "duration=$D audio_tracks=$NA mic_track=a:$TR" > probe/summary.txt; cat probe/summary.txt probe/volume.txt
+          # decode errors at 3 points (buggy/corrupt recordings) + is there real voice on the mic track?
+          ERR=0; for q in 10 50 90; do n=$(ffmpeg -v error -ss $(( D * q / 100 )) -t 20 -i src.mp4 -f null - 2>&1 | wc -l); ERR=$((ERR + n)); done
+          MV=$(ffmpeg -nostats -ss $T -t 120 -i src.mp4 -map 0:a:$TR -af volumedetect -f null - 2>&1 | sed -n 's/.*mean_volume: \(-\?[0-9.]*\) dB.*/\1/p' | head -1)
+          OK=$(python3 -c "import sys;m=float(sys.argv[1] or -99);e=int(sys.argv[2]);print('true' if m>-45 and e<30 else 'false')" "${MV:-}" "$ERR")
+          echo "decode_errors=$ERR mic_mean_db=${MV:-none} keep=$OK" >> probe/summary.txt; cat probe/summary.txt
+          echo "ok=$OK" >> "$GITHUB_OUTPUT"
           ffmpeg -v error -y -i src.mp4 -map 0:a:$TR -ac 1 -ar 16000 -c:a flac audio.flac
           rm -f src.mp4
           python3 - "$D" <<'PY'
@@ -102,6 +109,7 @@ jobs:
 
   tr:
     needs: ingest
+    if: needs.ingest.outputs.ok == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 150
     strategy:
@@ -152,12 +160,13 @@ jobs:
 
   merge:
     needs: [ingest, tr]
-    if: always() && needs.ingest.result == 'success'
+    if: always() && needs.ingest.result == 'success'   # also runs when tr was skipped (no voice / buggy): pushes the probe only
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
+        if: needs.tr.result == 'success' || needs.tr.result == 'failure'
         with: {pattern: "tr-${{ needs.ingest.outputs.stem }}-*", path: "${{ runner.temp }}/tr", merge-multiple: true}
       - uses: actions/download-artifact@v4
         with: {name: "probe-${{ needs.ingest.outputs.stem }}", path: "${{ runner.temp }}"}
@@ -169,11 +178,11 @@ jobs:
         run: |
           set -euo pipefail
           pip install -q cryptography
-          cd "$RUNNER_TEMP/tr"
-          for f in tr_*.enc; do openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass env:RENDER_KEY -in "$f" -out "${f%.enc}.json"; rm "$f"; done
-          N=$(python3 -c "import json,os;print(len(json.loads(os.environ['PARTS'])))"); HAVE=$(ls tr_*.json | wc -l)
+          mkdir -p "$RUNNER_TEMP/tr"; cd "$RUNNER_TEMP/tr"
+          for f in $(ls tr_*.enc 2>/dev/null); do openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass env:RENDER_KEY -in "$f" -out "${f%.enc}.json"; rm "$f"; done
+          N=$(python3 -c "import json,os;print(len(json.loads(os.environ['PARTS'] or '[]')))"); HAVE=$(ls tr_*.json 2>/dev/null | wc -l)
           echo "parts $HAVE/$N"
-          python3 "$GITHUB_WORKSPACE/drive/drive_fetch.py" words . "$RUNNER_TEMP/$STEM.wav.json"
+          if [ "$HAVE" -gt 0 ]; then python3 "$GITHUB_WORKSPACE/drive/drive_fetch.py" words . "$RUNNER_TEMP/$STEM.wav.json"; else echo '{"transcription":[],"skipped":"no voice or buggy (see probe)"}' > "$RUNNER_TEMP/$STEM.wav.json"; fi
           cd "$RUNNER_TEMP"
           echo "{\"stem\":\"$STEM\",\"parts\":$N,\"parts_done\":$HAVE,\"run\":\"$GITHUB_RUN_ID\"}" > status.json
           python3 "$GITHUB_WORKSPACE/drive/drive_fetch.py" seal "$STEM.wav.json" "$STEM.wav.json.sealed"
