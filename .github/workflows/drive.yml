@@ -1,0 +1,185 @@
+name: drive
+
+# Stream straight from Google Drive -> probe + mic audio + parallel transcription, no PC needed.
+# Public repo: the source only exists inside the runner; audio between jobs is a RENDER_KEY-encrypted artifact (1 day);
+# results go to branch drive-out sealed to drive/review_pub.pem (only the reviewer's private key opens them).
+# Start: push ONE file jobs/drive/<stem>.json = {"file_id": "...", "stem": "Record_2026-09-05-21-04-02", "game": "league"} (one per commit).
+# Secret needed: GDRIVE_SA_KEY (service account JSON with Viewer access to the Drive folder).
+on:
+  push:
+    branches: [main]
+    paths: ["jobs/drive/*.json"]
+  workflow_dispatch:
+    inputs:
+      job: {description: "path of a job file, e.g. jobs/drive/Record_2026-09-05-21-04-02.json", required: true, type: string}
+
+permissions:
+  contents: write
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      stem: ${{ steps.j.outputs.stem }}
+      parts: ${{ steps.p.outputs.parts }}
+      cuts: ${{ steps.p.outputs.cuts }}
+      game: ${{ steps.j.outputs.game }}
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 2}
+      - id: j
+        name: pick the job file
+        env:
+          IN_JOB: ${{ inputs.job }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ -n "${IN_JOB:-}" ]; then f="$IN_JOB"; else
+            f=$(git diff --name-only --diff-filter=AM "${BEFORE:-HEAD~1}" HEAD -- 'jobs/drive/*.json' 2>/dev/null | head -1 || true)
+            [ -n "$f" ] || f=$(git diff --name-only --diff-filter=AM HEAD~1 HEAD -- 'jobs/drive/*.json' | head -1)
+          fi
+          [[ "$f" =~ ^jobs/drive/[A-Za-z0-9._+-]{1,120}\.json$ ]] || { echo "bad job path: $f"; exit 1; }
+          python3 - "$f" <<'PY'
+          import json, re, sys, os
+          j = json.load(open(sys.argv[1]))
+          fid, stem, game = j["file_id"], j["stem"], j.get("game", "")
+          assert re.fullmatch(r"[A-Za-z0-9_-]{10,100}", fid), "bad file_id"
+          assert re.fullmatch(r"[A-Za-z0-9._+-]{1,100}", stem), "bad stem"
+          assert re.fullmatch(r"[a-z0-9]{0,20}", game), "bad game"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as o: o.write(f"fid={fid}\nstem={stem}\ngame={game}\n")
+          PY
+      - name: free disk (source can be 7+ GB)
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; df -h "$RUNNER_TEMP" | tail -1
+      - name: tools
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null
+          pip install -q cryptography
+      - name: download from Drive
+        env:
+          GDRIVE_SA_KEY: ${{ secrets.GDRIVE_SA_KEY }}
+          FID: ${{ steps.j.outputs.fid }}
+        run: python3 drive/drive_fetch.py get "$FID" "$RUNNER_TEMP/src.mp4"
+      - id: p
+        name: probe, frames, mic audio
+        env:
+          STEM: ${{ steps.j.outputs.stem }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"; mkdir -p probe
+          ffprobe -v error -show_entries format=duration:stream=index,codec_type,codec_name,width,height,channels -of json src.mp4 > probe/ffprobe.json
+          D=$(python3 -c "import json;print(int(float(json.load(open('probe/ffprobe.json'))['format']['duration'])))")
+          NA=$(python3 -c "import json;print(sum(s['codec_type']=='audio' for s in json.load(open('probe/ffprobe.json'))['streams']))")
+          T=$(( D > 900 ? 600 : D / 3 ))
+          : > probe/volume.txt
+          for i in $(seq 0 $((NA-1))); do
+            echo "a:$i $(ffmpeg -nostats -ss $T -t 60 -i src.mp4 -map 0:a:$i -af volumedetect -f null - 2>&1 | grep -E 'mean_volume|max_volume' | tr '\n' ' ')" >> probe/volume.txt
+          done
+          for k in 1 2 3 4; do ffmpeg -v error -y -ss $(( D * (k*20-10) / 100 )) -i src.mp4 -frames:v 1 -vf scale=480:-2 "probe/f$k.jpg"; done
+          # his mic: track 2 (a:1) when the recorder split voice from game (OBS / SteelSeries), else the only track
+          TR=0; [ "$NA" -ge 2 ] && TR=1
+          echo "duration=$D audio_tracks=$NA mic_track=a:$TR" > probe/summary.txt; cat probe/summary.txt probe/volume.txt
+          ffmpeg -v error -y -i src.mp4 -map 0:a:$TR -ac 1 -ar 16000 -c:a flac audio.flac
+          rm -f src.mp4
+          python3 - "$D" <<'PY'
+          import os, sys, json
+          d = int(sys.argv[1]); step = 600; cuts = list(range(0, d, step)) + [d]
+          if len(cuts) > 2 and cuts[-1] - cuts[-2] < 120: cuts.pop(-2)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as o:
+              o.write("cuts=" + ",".join(map(str, cuts)) + "\n" + "parts=" + json.dumps(list(range(len(cuts) - 1))) + "\n")
+          PY
+      - name: encrypt audio for the transcribe jobs
+        env:
+          RENDER_KEY: ${{ secrets.RENDER_KEY }}
+        run: |
+          cd "$RUNNER_TEMP"
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -salt -pass env:RENDER_KEY -in audio.flac -out audio.enc
+          tar -cf probe.tar probe && python3 "$GITHUB_WORKSPACE/drive/drive_fetch.py" seal probe.tar probe.sealed
+      - uses: actions/upload-artifact@v4
+        with: {name: "audio-${{ steps.j.outputs.stem }}", path: "${{ runner.temp }}/audio.enc", retention-days: 1}
+      - uses: actions/upload-artifact@v4
+        with: {name: "probe-${{ steps.j.outputs.stem }}", path: "${{ runner.temp }}/probe.sealed", retention-days: 1}
+
+  tr:
+    needs: ingest
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        part: ${{ fromJSON(needs.ingest.outputs.parts) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: {name: "audio-${{ needs.ingest.outputs.stem }}", path: "${{ runner.temp }}"}
+      - name: transcribe part
+        env:
+          RENDER_KEY: ${{ secrets.RENDER_KEY }}
+          CUTS: ${{ needs.ingest.outputs.cuts }}
+          PART: ${{ matrix.part }}
+          GAME: ${{ needs.ingest.outputs.game }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass env:RENDER_KEY -in audio.enc -out a.flac
+          sudo apt-get install -y -qq ffmpeg >/dev/null 2>&1 || true
+          ffmpeg -v error -y -i a.flac -ac 1 -ar 16000 a.wav
+          pip install -q faster-whisper cryptography
+          python3 - <<'PY'
+          import json, os, wave, numpy as np
+          from faster_whisper import WhisperModel
+          cuts = [float(x) for x in os.environ["CUTS"].split(",")]; p = int(os.environ["PART"]); a, b = cuts[p], cuts[p + 1]
+          w = wave.open("a.wav"); A = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768
+          crew = "Slade, Mesho, ميزور, فادي, بوب, العارضة"
+          terms = {"league": "Teemo, Jinx, Yasuo, Briar, gank, jungle, mid, ADC, support, Baron, Dragon, flash, ult",
+                   "tft": "TFT, augment, carousel, Kog'Maw, Corki, Lucian, Aphelios, reroll, level, econ, streak",
+                   "eafc": "Pro Clubs, goal, penalty, offside, VAR, Ultimate Team, skill move"}.get(os.environ.get("GAME", ""), "")
+          prompt = "ستريم جيمنج بالمصري. " + crew + (". " + terms if terms else "")
+          m = WhisperModel("large-v3", device="cpu", compute_type="int8", cpu_threads=4)
+          segs, _ = m.transcribe(A[int(a * 16000):int(b * 16000)], language="ar", word_timestamps=True, vad_filter=True, beam_size=5,
+                                 condition_on_previous_text=False, initial_prompt=prompt)
+          out = []
+          for s in segs:
+              out.append({"s": s.start + a, "e": s.end + a, "t": s.text.strip(), "p": s.avg_logprob,
+                          "w": [[x.start + a, x.end + a, x.word, x.probability] for x in (s.words or [])]})
+          json.dump(out, open(f"tr_{os.environ['PART']}.json", "w"), ensure_ascii=False)
+          print("segments", len(out))
+          PY
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -salt -pass env:RENDER_KEY -in "tr_$PART.json" -out "tr_$PART.enc"
+      - uses: actions/upload-artifact@v4
+        with: {name: "tr-${{ needs.ingest.outputs.stem }}-${{ matrix.part }}", path: "${{ runner.temp }}/tr_${{ matrix.part }}.enc", retention-days: 1}
+
+  merge:
+    needs: [ingest, tr]
+    if: always() && needs.ingest.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: {pattern: "tr-${{ needs.ingest.outputs.stem }}-*", path: "${{ runner.temp }}/tr", merge-multiple: true}
+      - uses: actions/download-artifact@v4
+        with: {name: "probe-${{ needs.ingest.outputs.stem }}", path: "${{ runner.temp }}"}
+      - name: merge transcript, seal results, push to drive-out
+        env:
+          RENDER_KEY: ${{ secrets.RENDER_KEY }}
+          STEM: ${{ needs.ingest.outputs.stem }}
+          PARTS: ${{ needs.ingest.outputs.parts }}
+        run: |
+          set -euo pipefail
+          pip install -q cryptography
+          cd "$RUNNER_TEMP/tr"
+          for f in tr_*.enc; do openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass env:RENDER_KEY -in "$f" -out "${f%.enc}.json"; rm "$f"; done
+          N=$(python3 -c "import json,os;print(len(json.loads(os.environ['PARTS'])))"); HAVE=$(ls tr_*.json | wc -l)
+          echo "parts $HAVE/$N"
+          python3 "$GITHUB_WORKSPACE/drive/drive_fetch.py" words . "$RUNNER_TEMP/$STEM.wav.json"
+          cd "$RUNNER_TEMP"
+          echo "{\"stem\":\"$STEM\",\"parts\":$N,\"parts_done\":$HAVE,\"run\":\"$GITHUB_RUN_ID\"}" > status.json
+          python3 "$GITHUB_WORKSPACE/drive/drive_fetch.py" seal "$STEM.wav.json" "$STEM.wav.json.sealed"
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -salt -pass env:RENDER_KEY -in "$STEM.wav.json" -out "$STEM.wav.json.enc"
+          git clone -q --depth 1 -b drive-out "https://x-access-token:${{ github.token }}@github.com/$GITHUB_REPOSITORY" out 2>/dev/null || {
+            git clone -q --depth 1 "https://x-access-token:${{ github.token }}@github.com/$GITHUB_REPOSITORY" out && cd out && git checkout -q --orphan drive-out && git rm -rqf . && cd ..; }
+          mkdir -p "out/$STEM" && cp probe.sealed "$STEM.wav.json.sealed" "$STEM.wav.json.enc" status.json "out/$STEM/"
+          cd out && git config user.name bot && git config user.email bot@users.noreply.github.com && git add -A && git commit -qm "drive: $STEM ($HAVE/$N parts)"
+          for i in 1 2 3 4 5; do git push -q origin HEAD:drive-out && break || { git pull -q --rebase origin drive-out; sleep $((RANDOM % 5 + 2)); }; done
