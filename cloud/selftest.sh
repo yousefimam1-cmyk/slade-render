@@ -5,12 +5,12 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"; W="$(mktemp -d)"; trap 'rm -rf "$W"' EXIT; bad=0
 [ -n "${SOCIAL_LAMMA_TOKEN:-}" ] || { echo "SELFTEST SKIP reason=no_token"; exit 3; }
-gen() { # <out> <bitrate>
-  ffmpeg -nostdin -v error -y -f lavfi -i "testsrc2=s=720x1280:r=30" -f lavfi -i "sine=f=440" -t 3 \
+gen() { # <out> <bitrate> <noise> [secs]
+  ffmpeg -nostdin -v error -y -f lavfi -i "testsrc2=s=720x1280:r=30" -f lavfi -i "sine=f=440" -t "${4:-3}" \
     -vf "noise=alls=${3:-0}:allf=t" -c:v libx264 -preset ultrafast -b:v "$2" -minrate "$2" -maxrate "$2" -bufsize "$2" -c:a aac -shortest "$1"
 }
-gen "$W/small.mp4" 1M 0; gen "$W/big.mp4" 60M 100
-for k in small big; do
+gen "$W/small.mp4" 1M 0; gen "$W/big.mp4" 60M 100; gen "$W/huge.mp4" 200M 100 6     # ~150 MB: more than one part if the edge splits at 100 MB or less
+for k in small big huge; do
   f="$W/$k.mp4"; python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import qa_media as Q; print("final_codes", Q.final_codes(sys.argv[2]))' "$HERE" "$f"
   t0=$(date +%s.%N); line=$(python3 "$HERE/handoff.py" --file "$f" --id "selftest_$k" --out "$W/$k.json" --filename "selftest_$k.mp4" 2>&1); rc=$?; t1=$(date +%s.%N)
   echo "$line (rc=$rc, $(du -h "$f" | cut -f1))"
