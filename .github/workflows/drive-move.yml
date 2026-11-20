@@ -1,6 +1,7 @@
 name: drive-move
 
-# Move Drive files/folders into the 'delete' folder (never deletes). Start: push jobs/move/<name>.json = {"ids": ["...", ...]}.
+# Move Drive files/folders (never deletes). Start: push jobs/move/<name>.json = {"ids": ["...", ...], "to": "delete"|"done"|<folder id>}.
+# delete = 1CM4UYGu19cj7wkV2Q6fNhCJT8_hdr1UF, done = "done content" 1WRpaTxo-_iRaZ_37zpXa7v5VqbrnBhNC
 on:
   push:
     branches: [main]
@@ -23,9 +24,12 @@ jobs:
           set -uo pipefail
           pip install -q cryptography
           for f in $(git diff --name-only --diff-filter=AM HEAD~1 HEAD -- 'jobs/move/*.json'); do
-            python3 - "$f" <<'PY' | while read id; do python3 drive/drive_fetch.py move "$id" || echo "FAILED $id"; done
+            python3 - "$f" <<'PY' | while read id to; do python3 drive/drive_fetch.py move "$id" "$to" || echo "FAILED $id"; done
           import json, re, sys
-          for i in json.load(open(sys.argv[1]))["ids"]:
-              if re.fullmatch(r"[A-Za-z0-9_-]{10,100}", i): print(i)
+          j = json.load(open(sys.argv[1])); to = j.get("to", "delete")
+          to = {"delete": "1CM4UYGu19cj7wkV2Q6fNhCJT8_hdr1UF", "done": "1WRpaTxo-_iRaZ_37zpXa7v5VqbrnBhNC"}.get(to, to)
+          assert re.fullmatch(r"[A-Za-z0-9_-]{10,100}", to), "bad folder"
+          for i in j["ids"]:
+              if re.fullmatch(r"[A-Za-z0-9_-]{10,100}", i): print(i, to)
           PY
           done
