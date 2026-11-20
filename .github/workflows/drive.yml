@@ -95,6 +95,13 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as o:
               o.write("cuts=" + ",".join(map(str, cuts)) + "\n" + "parts=" + json.dumps(list(range(len(cuts) - 1))) + "\n")
           PY
+      - name: no voice / buggy -> move to the Drive 'delete' folder (never deleted)
+        if: steps.p.outputs.ok != 'true'
+        continue-on-error: true
+        env:
+          GDRIVE_SA_KEY: ${{ secrets.GDRIVE_SA_KEY }}
+          FID: ${{ steps.j.outputs.fid }}
+        run: python3 drive/drive_fetch.py move "$FID"
       - name: encrypt audio for the transcribe jobs
         env:
           RENDER_KEY: ${{ secrets.RENDER_KEY }}

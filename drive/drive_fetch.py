@@ -4,6 +4,7 @@
   drive_fetch.py token                      print an access token (service account JSON in env GDRIVE_SA_KEY)
   drive_fetch.py meta <file_id>             print {"name","size","mimeType"} as JSON
   drive_fetch.py get <file_id> <out>        download (resumes on network errors, checks the size)
+  drive_fetch.py move <file_id> [folder]  move into the 'delete' folder (service account must be Editor)
   drive_fetch.py seal <in> <out>            encrypt for the reviewer: random AES key wrapped with drive/review_pub.pem
   drive_fetch.py unseal <in> <out> <priv>   (reviewer side) decrypt
   drive_fetch.py words <tr_dir> <out.json>  merge faster-whisper parts -> whisper-style {"transcription":[...]} with echo/MSA cleanup
@@ -19,11 +20,11 @@ API = "https://www.googleapis.com/drive/v3/files/"
 def _b64(b): return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
 
 
-def token():
+def token(scope="https://www.googleapis.com/auth/drive.readonly"):
     sa = json.loads(os.environ["GDRIVE_SA_KEY"])
     now = int(time.time())
     head = _b64(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
-    body = _b64(json.dumps({"iss": sa["client_email"], "scope": "https://www.googleapis.com/auth/drive.readonly",
+    body = _b64(json.dumps({"iss": sa["client_email"], "scope": scope,
                             "aud": "https://oauth2.googleapis.com/token", "iat": now, "exp": now + 3600}).encode())
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding
@@ -39,6 +40,19 @@ def meta(fid, tok=None):
     q = urllib.parse.urlencode({"fields": "name,size,mimeType", "supportsAllDrives": "true"})
     req = urllib.request.Request(API + urllib.parse.quote(fid) + "?" + q, headers={"Authorization": "Bearer " + tok})
     with urllib.request.urlopen(req, timeout=60) as r: return json.load(r)
+
+
+DELETE_FOLDER = os.environ.get("DRIVE_DELETE_FOLDER", "1CM4UYGu19cj7wkV2Q6fNhCJT8_hdr1UF")
+def move(fid, folder=DELETE_FOLDER):
+    """move a file/folder into `folder` (needs the service account as Editor). Never deletes."""
+    tok = token("https://www.googleapis.com/auth/drive")
+    q = urllib.parse.urlencode({"fields": "parents,name", "supportsAllDrives": "true"})
+    with urllib.request.urlopen(urllib.request.Request(API + urllib.parse.quote(fid) + "?" + q, headers={"Authorization": "Bearer " + tok}), timeout=60) as r: m = json.load(r)
+    old = ",".join(p for p in m.get("parents", []) if p != folder)
+    q = urllib.parse.urlencode({"addParents": folder, "removeParents": old, "supportsAllDrives": "true", "fields": "id,parents"})
+    req = urllib.request.Request(API + urllib.parse.quote(fid) + "?" + q, data=b"{}", method="PATCH", headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r: json.load(r)
+    print("moved", m.get("name"), "->", folder)
 
 
 def get(fid, out):
@@ -123,6 +137,7 @@ if __name__ == "__main__":
     if c == "token": print(token())
     elif c == "meta": print(json.dumps(meta(a[0]), ensure_ascii=False))
     elif c == "get": get(a[0], a[1])
+    elif c == "move": move(*a[:2])
     elif c == "seal": seal(a[0], a[1])
     elif c == "unseal": unseal(*a[:3])
     elif c == "words": words(a[0], a[1])

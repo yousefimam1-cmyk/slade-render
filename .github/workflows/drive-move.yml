@@ -1,0 +1,31 @@
+name: drive-move
+
+# Move Drive files/folders into the 'delete' folder (never deletes). Start: push jobs/move/<name>.json = {"ids": ["...", ...]}.
+on:
+  push:
+    branches: [main]
+    paths: ["jobs/move/*.json"]
+
+permissions:
+  contents: read
+
+jobs:
+  move:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 2}
+      - name: move
+        env:
+          GDRIVE_SA_KEY: ${{ secrets.GDRIVE_SA_KEY }}
+        run: |
+          set -uo pipefail
+          pip install -q cryptography
+          for f in $(git diff --name-only --diff-filter=AM HEAD~1 HEAD -- 'jobs/move/*.json'); do
+            python3 - "$f" <<'PY' | while read id; do python3 drive/drive_fetch.py move "$id" || echo "FAILED $id"; done
+          import json, re, sys
+          for i in json.load(open(sys.argv[1]))["ids"]:
+              if re.fullmatch(r"[A-Za-z0-9_-]{10,100}", i): print(i)
+          PY
+          done
