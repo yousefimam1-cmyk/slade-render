@@ -17,6 +17,11 @@ on:
         description: "release tag holding <reel>.tar.enc + code.tar.enc"
         required: true
         type: string
+      direct:
+        description: "direct Social Lamma media upload from the runner (default on); 0 = off, the PC downloads the videos"
+        required: false
+        default: "1"
+        type: string
 
 permissions:
   contents: read
@@ -153,6 +158,7 @@ jobs:
         env:
           RENDER_KEY: ${{ secrets.RENDER_KEY }}
           SOCIAL_LAMMA_TOKEN: ${{ secrets.SOCIAL_LAMMA_TOKEN }}
+          SOCIAL_DIRECT: ${{ inputs.direct || vars.SOCIAL_DIRECT || '1' }}
           GH_TOKEN: ${{ github.token }}
           SRC_CACHE_TAG: src-cache
           REEL: ${{ matrix.reel }}
@@ -199,7 +205,8 @@ jobs:
         id: on
         env:
           T: ${{ secrets.SOCIAL_LAMMA_TOKEN }}
-        run: if [ -n "$T" ]; then echo "on=1" >> "$GITHUB_OUTPUT"; else echo "JOIN SKIP ${{ matrix.vid }} reason=no_token (the PC joins the parts as before)"; fi
+          D: ${{ inputs.direct || vars.SOCIAL_DIRECT || '1' }}
+        run: if [ -n "$T" ] && [[ ! "${D,,}" =~ ^(0|false|off|no|n)$ ]]; then echo "on=1" >> "$GITHUB_OUTPUT"; else echo "JOIN SKIP ${{ matrix.vid }} reason=no_token (the PC joins the parts as before)"; fi
 
       - uses: actions/checkout@v4
         if: steps.on.outputs.on == '1'
@@ -249,6 +256,7 @@ jobs:
         env:
           RENDER_KEY: ${{ secrets.RENDER_KEY }}
           SOCIAL_LAMMA_TOKEN: ${{ secrets.SOCIAL_LAMMA_TOKEN }}
+          SOCIAL_DIRECT: ${{ inputs.direct || vars.SOCIAL_DIRECT || '1' }}
           VID: ${{ matrix.vid }}
         run: bash cloud/yt_join_job.sh "$VID" "$RUNNER_TEMP/parts" "$RUNNER_TEMP/code/code.tar.enc" "$RUNNER_TEMP/out"
 

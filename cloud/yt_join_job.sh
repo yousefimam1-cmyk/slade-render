@@ -4,7 +4,8 @@
 # Decrypts them in parallel, joins with the PC's own yt_join.py (stream copy, frame-checked), sums the part QA, then (QA PASS + token):
 # hand-off to Social Lamma + previews + <outdir>/<vid>.full.tar.enc; <outdir>/<vid>.out.tar.enc = sidecars (srt, chapters, description,
 # thumbnail, layout, parts.json, qa) + handoff.json, no video. Hand-off failed -> the joined mp4 goes inside <vid>.out.tar.enc (one file instead
-# of all the parts). Missing part -> no output at all: the PC falls back to the parts. env RENDER_KEY, SOCIAL_LAMMA_TOKEN.
+# of all the parts). Missing part -> no output at all: the PC falls back to the parts. env RENDER_KEY, SOCIAL_LAMMA_TOKEN, SOCIAL_DIRECT (0 = off).
+# Sync (subtitle timing) is only a warning; the joined video must have audio, >= 1 s and the audio's length, else it stays on the PC path.
 set -euo pipefail
 VID="$1"; ART="$(cd "$2" && pwd)"; CODE="$3"; OUT="$4"; HERE="$(cd "$(dirname "$0")" && pwd)"
 [[ "$VID" =~ ^[A-Za-z0-9_]{1,30}$ ]] || { echo "bad vid"; exit 2; }
@@ -34,12 +35,17 @@ done
 need=$(python3 -c 'import json,sys; P=json.load(open(sys.argv[1])); print(" ".join(sys.argv[2] + "-" + c["part"] + ".mp4" for c in P["chunks"]))' "$W/pkg/yt/$VID.parts.json" "$VID")
 for n in $need "$VID.m4a"; do [ -f "$W/pkg/yt/$n" ] || { echo "JOIN SKIP $VID reason=missing_part"; exit 0; }; done
 python3 "$W/code/yt_join.py" "$W/pkg/yt" "$VID" --out "$W/pkg/yt/$VID.mp4" --clean >>"$W/pkg/render.log" 2>&1 || { echo "JOIN FAIL $VID code=join"; exit 1; }
+AUD_SECS=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$W/pkg/yt/$VID.m4a" 2>/dev/null || echo 0)
 rm -f "$W/pkg/yt/$VID.m4a"
 echo "JOIN OK $VID"
 # QA of the whole video = every part's QA (qa_media already ran per part on its runner)
-QAL=$(python3 - "$W/pkg/yt" "$VID" <<'EOF'
+QAL=$(python3 - "$W/pkg/yt" "$VID" "$HERE" "${AUD_SECS:-0}" <<'EOF'
 import glob, json, os, re, sys
-d, vid = sys.argv[1:3]; parts = {}; codes = []; warn = []
+d, vid, here, aud = sys.argv[1:5]; parts = {}; codes = []; warn = []
+sys.path.insert(0, here)
+try:                                        # hard checks on the joined video itself: exists, not tiny, has audio, length = the audio it was built on
+    import qa_media; codes += qa_media.final_codes(os.path.join(d, vid + ".mp4"), float(aud) or None)
+except Exception: warn.append("qa_error")
 for p in sorted(glob.glob(os.path.join(d, vid + "-*.qa.json"))):
     try: q = json.load(open(p, encoding="utf-8"))
     except Exception: continue
@@ -53,7 +59,8 @@ print((f"QA FAIL {vid} codes={','.join(codes)}" if codes else f"QA PASS {vid}") 
 EOF
 )
 echo "$QAL" | grep -E '^QA (PASS|FAIL) [A-Za-z0-9_-]+( codes=[a-z_,]+)?( warn=[a-z_,]+)?$' || true
-if [[ "$QAL" == "QA PASS "* ]]; then
+# SOCIAL_DIRECT=0 (opt-out) keeps today's path: the PC downloads the video
+if [[ "$QAL" == "QA PASS "* ]] && [[ "$(printf '%s' "${SOCIAL_DIRECT:-1}" | tr 'A-Z' 'a-z')" != @(0|false|off|no|n) ]]; then
   v="$W/pkg/yt/$VID.mp4"; hrc=0; frc=0
   python3 "$HERE/handoff.py" --file "$v" --id "$VID" --out "$W/pkg/yt/$VID.handoff.json" --filename "$VID.mp4" >"$W/ho.line" 2>/dev/null & hp=$!
   python3 "$HERE/previews.py" "$v" "$W/pkg/yt" "$VID" --yt >"$W/pv.line" 2>/dev/null & pp=$!

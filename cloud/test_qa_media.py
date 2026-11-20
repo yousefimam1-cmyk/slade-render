@@ -36,7 +36,7 @@ class Media(unittest.TestCase):
         self.assertEqual(Q.parse_black("black_start:9.45 black_end:10", 10.0), [])
         self.assertEqual(Q.parse_black("black_start:0 black_end:0.7", 10.0), [[0.0, 0.7]])
 
-    def test_reel_end_to_end_sync_fail_and_public_line_has_no_text(self):
+    def test_reel_end_to_end_sync_is_a_warning_and_public_line_has_no_text(self):
         pkg = tempfile.mkdtemp(dir=self.d); os.makedirs(os.path.join(pkg, "reels"))
         shutil.copy(self.p("sound"), os.path.join(pkg, "reels", "rG1.mp4"))
         words = ["كلمة%d" % i for i in range(12)]
@@ -44,15 +44,22 @@ class Media(unittest.TestCase):
         open(os.path.join(pkg, "reels", "rG1.srt"), "w", encoding="utf-8").write(srt)
         heard = [{"w": w, "s": i * 0.5 - 1.5} for i, w in enumerate(words)]   # speech 1.5 s earlier -> captions late
         res = Q.qa("rG1", pkg, whisper=lambda m, t: (heard, 9.0)); Q.write(res, pkg)
-        self.assertEqual(res["codes"], ["sync"]); self.assertAlmostEqual(res["checks"]["sync"]["median"], 1.5, delta=0.01)
-        line = open(os.path.join(pkg, "qa.line")).read().strip(); self.assertEqual(line, "QA FAIL rG1 codes=sync")
+        self.assertEqual((res["codes"], res["warn"], res["status"]), ([], ["sync"], "PASS")); self.assertAlmostEqual(res["checks"]["sync"]["median"], 1.5, delta=0.01)
+        line = open(os.path.join(pkg, "qa.line")).read().strip(); self.assertEqual(line, "QA PASS rG1 warn=sync")
         self.assertTrue(os.path.isfile(os.path.join(pkg, "reels", "rG1.qa.json")))
         res2 = Q.qa("rG1", pkg, whisper=lambda m, t: ([{"w": w, "s": i * 0.5 + 0.05} for i, w in enumerate(words)], 9.0))
         self.assertEqual(res2["status"], "PASS"); self.assertEqual(Q.public_line(res2), "QA PASS rG1")
 
+    def test_hard_failures_no_audio_and_no_video(self):
+        pkg = tempfile.mkdtemp(dir=self.d); os.makedirs(os.path.join(pkg, "reels"))
+        ff("-f", "lavfi", "-i", "testsrc2=s=160x284:r=10:d=3", "-an", os.path.join(pkg, "reels", "r9.mp4"))
+        res = Q.qa("r9", pkg); self.assertIn("no_audio", res["codes"]); self.assertEqual(res["status"], "FAIL")
+        self.assertEqual(Q.final_codes(os.path.join(pkg, "nope.mp4")), ["no_video"])
+        self.assertEqual(Q.final_codes(self.p("sound"), expect_secs=99), ["duration"])
+
     def test_whisper_crash_never_fails_the_render(self):
         pkg = tempfile.mkdtemp(dir=self.d); os.makedirs(os.path.join(pkg, "reels"))
-        shutil.copy(self.p("src"), os.path.join(pkg, "reels", "r2.mp4")); open(os.path.join(pkg, "reels", "r2.srt"), "w").write("1\n00:00:00,000 --> 00:00:01,000\nاهلا\n")
+        shutil.copy(self.p("sound"), os.path.join(pkg, "reels", "r2.mp4")); open(os.path.join(pkg, "reels", "r2.srt"), "w").write("1\n00:00:00,000 --> 00:00:01,000\nاهلا\n")
         def boom(m, t): raise RuntimeError("secret transcript text")
         res = Q.qa("r2", pkg, whisper=boom); self.assertEqual(Q.public_line(res), "QA PASS r2 warn=qa_error")
 

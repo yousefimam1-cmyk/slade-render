@@ -1,0 +1,28 @@
+name: selftest-direct-upload
+
+# Proves the runner -> Social Lamma media upload (repo secret SOCIAL_LAMMA_TOKEN): uploads a 3 s clip (single PUT) and a ~25 MB clip (multipart)
+# as MEDIA ONLY, brand slade, never a post. Prints the test media ids. Run: gh workflow run selftest-direct-upload
+on:
+  workflow_dispatch:
+  push:
+    branches: ["claude/direct-upload-default"]
+    paths: [".github/workflows/selftest.yml", "cloud/selftest.sh"]
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: ffmpeg
+        run: command -v ffmpeg >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg; }
+      - name: pip numpy (qa_media import)
+        run: pip install -q numpy
+      - name: upload 3 s + 25 MB test clips as media only
+        env:
+          SOCIAL_LAMMA_TOKEN: ${{ secrets.SOCIAL_LAMMA_TOKEN }}
+          SOCIAL_LAMMA_BRAND: slade
+        run: bash cloud/selftest.sh

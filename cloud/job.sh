@@ -33,6 +33,7 @@ PUB_RE='^(HANDOFF (OK|FAIL|SKIP) [A-Za-z0-9_-]+( parts=[0-9]+| code=[a-z0-9_]+| 
 hand() {
   local pkg="$1" id="$2" v="$3" yt="${4:-}" d hrc=0 frc=0; d="$(dirname "$v")"
   [ -n "${SOCIAL_LAMMA_TOKEN:-}" ] && [ -f "$v" ] || return 1
+  case "$(printf '%s' "${SOCIAL_DIRECT:-1}" | tr 'A-Z' 'a-z')" in 0|false|off|no|n) echo "HANDOFF SKIP $id reason=disabled"; return 1;; esac
   python3 "$HERE/handoff.py" --file "$v" --id "$id" --out "$d/$id.handoff.json" --filename "$id.mp4" >"$W/ho.line" 2>/dev/null & local hp=$!
   python3 "$HERE/previews.py" "$v" "$d" "$id" $yt >"$W/pv.line" 2>/dev/null & local pp=$!
   ( tar -C "$pkg" -cf - "${v#"$pkg"/}" | "${OSSL[@]}" -e -salt -out "$OUT/$id.full.tar.enc" ) & local fp=$!

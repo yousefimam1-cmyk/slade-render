@@ -96,6 +96,18 @@ class Handoff(unittest.TestCase):
         self.assertEqual(H.norm_token("https://social.example/mcp/" + "A" * 30 + "/"), "A" * 30)
         self.assertEqual(H.norm_token("  plainTOKEN_123  "), "plainTOKEN_123")
 
+    def test_failed_parts_resume_without_resending_the_done_ones(self):
+        fk = FakeSocial(part=4096, fail={"part2": 4}); rc, line, rec = self.run_(fk)      # 3 tries in round 1 fail, round 2 resumes part 2 only
+        self.assertEqual(rc, 0, line); self.assertIsNotNone(fk.completed)
+        self.assertEqual(b"".join(fk.parts[i] for i in sorted(fk.parts)), open(self.mp4, "rb").read())
+        self.assertEqual(sum(1 for m, u in fk.calls if u.endswith("/part/1")), 1)
+
+    def test_complete_is_retried_and_opt_out_skips(self):
+        fk = FakeSocial(part=4096, fail={"complete_media_upload": 2}); rc, line, _ = self.run_(fk); self.assertEqual(rc, 0, line)
+        os.environ["SOCIAL_DIRECT"] = "0"
+        try: rc, line, rec = self.run_(FakeSocial()); self.assertEqual((rc, line, rec), (3, "HANDOFF SKIP r01 reason=disabled", None))
+        finally: del os.environ["SOCIAL_DIRECT"]
+
     def test_part_upload_failure_is_a_fail_code(self):
         rc, line, rec = self.run_(FakeSocial(part=4096, fail={"part3": 99}))
         self.assertEqual((rc, line, rec), (1, "HANDOFF FAIL r01 code=part_http_500", None))

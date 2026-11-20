@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 TOKEN_VAR = "SOCIAL_LAMMA_TOKEN"
 BASE = (os.environ.get("SOCIAL_LAMMA_BASE") or "https://social.lammaonline.website").rstrip("/")
 BRAND = os.environ.get("SOCIAL_LAMMA_BRAND") or "slade"
+OFF = {"0", "false", "off", "no", "n"}           # SOCIAL_DIRECT=0 (env / workflow input / repo variable) turns the direct upload off
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 PAR = int(os.environ.get("HANDOFF_PARALLEL", "4"))
 UA = "slade-render/1.0 (+github actions)"     # the site's edge refuses the default Python-urllib agent (403 on part PUTs)
@@ -53,6 +54,7 @@ class Client:
             except (urllib.error.URLError, OSError): code = -1
             if code in (-1, 429, 500, 502, 503, 504) and tr < 3: self.sleep(3 * (tr + 1)); continue
             break
+        if code == 403 and re.search(rb"cloudflare|error code: 10\d\d|just a moment|attention required", raw[:4000], re.I): raise HandoffError("edge_blocked")
         if code in (401, 403): raise HandoffError("token_refused")
         if code != 200: raise HandoffError(f"{tool}_http_{code}")
         try: j = json.loads(raw.decode("utf-8", "replace"))
@@ -108,25 +110,43 @@ def upload(client, path, filename=None, mime="video/mp4", parallel=PAR):
     if n_parts < 1 or ps < 1: raise HandoffError("bad_part_size")
 
     def put(n):
+        """one part, 3 tries with backoff -> (n, etag); HandoffError when the tries are used up"""
         with open(path, "rb") as f: f.seek((n - 1) * ps); data = f.read(ps)
         url = u["partUrlTemplate"].replace("{partNumber}", str(n)).replace("{n}", str(n)); code = 0
-        for tr in range(5):
+        for tr in range(3):
             try: code, hd, raw = t("PUT", url, {"Content-Type": "application/octet-stream", "Content-Length": str(len(data)), "User-Agent": UA}, data, 900)
             except (urllib.error.URLError, OSError): code, hd, raw = -1, {}, b""
             et = _etag(hd, raw)
             if 200 <= code < 300 and et: return n, et
             if code == 409: raise HandoffError("upload_expired")
-            client.sleep(2 * (tr + 1))
+            if tr < 2: client.sleep(2 * 3 ** tr)                       # 2 s, 6 s
         raise HandoffError(f"part_http_{code}")
 
-    with ThreadPoolExecutor(max(1, min(parallel, n_parts))) as ex: done = dict(ex.map(put, range(1, n_parts + 1)))
-    client.call("complete_media_upload", {"media_id": mid, "parts": [{"partNumber": n, "etag": done[n]} for n in sorted(done)]})
+    done, last = {}, None                                              # finished parts survive a failed round: only the missing ones are sent again
+    for rnd in range(3):
+        todo = [n for n in range(1, n_parts + 1) if n not in done]
+        if not todo: break
+        with ThreadPoolExecutor(max(1, min(parallel, len(todo)))) as ex: futs = {n: ex.submit(put, n) for n in todo}
+        for n, fu in futs.items():
+            try: k, et = fu.result(); done[k] = et
+            except HandoffError as e:
+                if e.code == "upload_expired": raise
+                last = e
+        if len(done) < n_parts and rnd < 2: client.sleep(5 * (rnd + 1))
+    if len(done) < n_parts: raise last or HandoffError("part_missing")
+    body = {"media_id": mid, "parts": [{"partNumber": n, "etag": done[n]} for n in sorted(done)]}
+    for tr in range(3):                                                # complete_media_upload: the edge may hiccup once the parts are in
+        try: client.call("complete_media_upload", body); break
+        except HandoffError as e:
+            if tr == 2 or e.code in ("token_refused", "edge_blocked"): raise
+            client.sleep(3 * (tr + 1))
     return mid, n_parts
 
 
 def handoff(path, rid, out, token=None, client=None, filename=None):
     """-> (exit code, public line). 0 ok, 1 fail, 3 skipped (no token / no file)."""
     rid = rid if ID_RE.match(rid or "") else "x"
+    if (os.environ.get("SOCIAL_DIRECT") or "1").strip().lower() in OFF: return 3, f"HANDOFF SKIP {rid} reason=disabled"
     tok = norm_token(token if token is not None else os.environ.get(TOKEN_VAR))
     if not tok and client is None: return 3, f"HANDOFF SKIP {rid} reason=no_token"
     if not os.path.isfile(path) or os.path.getsize(path) < 1000: return 3, f"HANDOFF SKIP {rid} reason=no_video"

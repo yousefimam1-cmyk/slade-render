@@ -3,7 +3,7 @@
 
   qa_media.py --id <reel or yt part> --pkg <pkg dir>
 
-Checks: black (blackdetect), loop (repeated moving frames, dHash), sync (captions vs faster-whisper words),
+Checks: black (blackdetect), loop (repeated/frozen frames, dHash), no_video/short/no_audio (hard), sync (captions vs faster-whisper words: WARN only),
 memes (YouTube -aud: meme visible shorter than its clip, warn only).
 Writes <pkg>/qa.json + <pkg>/{reels|yt}/<id>.qa.json (encrypted with the outputs) and <pkg>/qa.line,
 the ONLY public text: "QA PASS <id>" / "QA FAIL <id> codes=a,b" (+ " warn=x"). Never prints captions or transcript text.
@@ -22,6 +22,19 @@ def duration(p):
     r = run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", p], timeout=60)
     try: return float(r.stdout.decode().strip())
     except ValueError: return 0.0
+
+def has_audio(p):
+    r = run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", p], timeout=60)
+    return b"audio" in r.stdout
+
+def final_codes(mp4, expect_secs=None, tol=1.5):
+    """hard failures of a finished video: no_video, short, no_audio, duration (vs the audio it was built on)"""
+    if not os.path.isfile(mp4) or os.path.getsize(mp4) < 1000: return ["no_video"]
+    out = []; dur = duration(mp4)
+    if dur < 1.0: out.append("short")
+    if not has_audio(mp4): out.append("no_audio")
+    if expect_secs and dur > 0 and abs(dur - expect_secs) > tol: out.append("duration")
+    return out
 
 # ---------------- a) black ----------------
 def parse_black(stderr, dur):
@@ -200,6 +213,9 @@ def qa(rid, pkg, whisper=None):
             lo = check_loop(mp4); res["checks"]["loop"] = lo
             if lo: res["codes"].append("loop")
         guard("black", b); guard("loop", lp)
+        if not yt:
+            def fin(): res["codes"] += [c for c in final_codes(mp4) if c not in res["codes"]]
+            guard("final", fin)
     caps = media = None; lay = {}
     if yt and rid.endswith("-aud"):
         vid = rid[:-4]; lp_ = os.path.join(d, vid + ".layout.json")
@@ -214,7 +230,7 @@ def qa(rid, pkg, whisper=None):
             with tempfile.TemporaryDirectory() as tmp: heard, secs = whisper(media, tmp)
             cs = [c for c in caps if c["s"] <= secs + SYNC_WIN]
             st = sync_stats(cs, heard); st["heard"] = len(heard); res["checks"]["sync"] = st
-            if sync_fail(st): res["codes"].append("sync")
+            if sync_fail(st): res["warn"].append("sync")        # subtitle timing alone never blocks the hand-off (whisper offsets on music/overlaps are noisy)
         guard("sync", sy)
     if lay:
         def mm():
