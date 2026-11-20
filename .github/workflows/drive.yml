@@ -77,8 +77,16 @@ jobs:
             echo "a:$i $(ffmpeg -nostats -ss $T -t 60 -i src.mp4 -map 0:a:$i -af volumedetect -f null - 2>&1 | grep -E 'mean_volume|max_volume' | tr '\n' ' ')" >> probe/volume.txt
           done
           for k in 1 2 3 4; do ffmpeg -v error -y -ss $(( D * (k*20-10) / 100 )) -i src.mp4 -frames:v 1 -vf scale=480:-2 "probe/f$k.jpg"; done
-          # his mic: track 2 (a:1) when the recorder split voice from game (OBS / SteelSeries), else the only track
-          TR=0; [ "$NA" -ge 2 ] && TR=1
+          # his mic: the loudest NON-silent extra track (OBS: a:1, SteelSeries: a:2 with a:1 silent), else the mix a:0
+          TR=$(python3 - "$NA" <<'PY'
+          import re, sys
+          na = int(sys.argv[1]); best, bv = 0, -999.0
+          for line in open("probe/volume.txt"):
+              m = re.match(r"a:(\d+).*mean_volume: (-?[\d.]+) dB", line)
+              if m and int(m.group(1)) > 0 and float(m.group(2)) > -60 and float(m.group(2)) > bv: best, bv = int(m.group(1)), float(m.group(2))
+          print(best)
+          PY
+          )
           echo "duration=$D audio_tracks=$NA mic_track=a:$TR" > probe/summary.txt; cat probe/summary.txt probe/volume.txt
           # decode errors at 3 points (buggy/corrupt recordings) + is there real voice on the mic track?
           ERR=0; for q in 10 50 90; do n=$(ffmpeg -v error -ss $(( D * q / 100 )) -t 20 -i src.mp4 -f null - 2>&1 | wc -l); ERR=$((ERR + n)); done
