@@ -26,6 +26,7 @@ jobs:
       cuts: ${{ steps.p.outputs.cuts }}
       game: ${{ steps.j.outputs.game }}
       ok: ${{ steps.p.outputs.ok }}
+      tag: ${{ steps.j.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with: {fetch-depth: 2}
@@ -44,11 +45,12 @@ jobs:
           python3 - "$f" <<'PY'
           import json, re, sys, os
           j = json.load(open(sys.argv[1]))
-          fid, stem, game = j["file_id"], j["stem"], j.get("game", "")
-          assert re.fullmatch(r"[A-Za-z0-9_-]{10,100}", fid), "bad file_id"
+          fid, stem, game = j.get("file_id", ""), j["stem"], j.get("game", "")
+          tag = j.get("audio_tag", "")   # PC streams: mic audio uploaded by cloud_tx.py as an encrypted release asset (no Drive)
+          assert (fid and re.fullmatch(r"[A-Za-z0-9_-]{10,100}", fid)) or re.fullmatch(r"tx-[A-Za-z0-9._+-]{1,100}", tag), "need file_id or audio_tag"
           assert re.fullmatch(r"[A-Za-z0-9._+-]{1,100}", stem), "bad stem"
           assert re.fullmatch(r"[a-z0-9]{0,20}", game), "bad game"
-          with open(os.environ["GITHUB_OUTPUT"], "a") as o: o.write(f"fid={fid}\nstem={stem}\ngame={game}\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as o: o.write(f"fid={fid}\nstem={stem}\ngame={game}\ntag={tag}\n")
           PY
       - name: free disk (source can be 7+ GB)
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; df -h "$RUNNER_TEMP" | tail -1
@@ -56,7 +58,20 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null
           pip install -q cryptography
+      - name: PC audio from release (cloud_tx.py)
+        if: steps.j.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RENDER_KEY: ${{ secrets.RENDER_KEY }}
+          TAG: ${{ steps.j.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"; gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p audio.flac.enc
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -pass env:RENDER_KEY -in audio.flac.enc -out audio_in.flac
+          ffmpeg -v error -y -i audio_in.flac -c:a flac src.mka && rm audio.flac.enc audio_in.flac
+          mv src.mka src.mp4   # one-track audio-only container; the probe below handles it (frames are skipped)
       - name: download from Drive
+        if: steps.j.outputs.tag == ''
         env:
           GDRIVE_SA_KEY: ${{ secrets.GDRIVE_SA_KEY }}
           FID: ${{ steps.j.outputs.fid }}
@@ -76,7 +91,7 @@ jobs:
           for i in $(seq 0 $((NA-1))); do
             echo "a:$i $(ffmpeg -nostats -ss $T -t 60 -i src.mp4 -map 0:a:$i -af volumedetect -f null - 2>&1 | grep -E 'mean_volume|max_volume' | tr '\n' ' ')" >> probe/volume.txt
           done
-          for k in 1 2 3 4; do ffmpeg -v error -y -ss $(( D * (k*20-10) / 100 )) -i src.mp4 -frames:v 1 -vf scale=480:-2 "probe/f$k.jpg"; done
+          for k in 1 2 3 4; do ffmpeg -v error -y -ss $(( D * (k*20-10) / 100 )) -i src.mp4 -frames:v 1 -vf scale=480:-2 "probe/f$k.jpg" 2>/dev/null || true; done
           # his mic: the loudest NON-silent extra track (OBS: a:1, SteelSeries: a:2 with a:1 silent), else the mix a:0
           TR=$(python3 - "$NA" <<'PY'
           import re, sys
@@ -190,6 +205,8 @@ jobs:
           RENDER_KEY: ${{ secrets.RENDER_KEY }}
           STEM: ${{ needs.ingest.outputs.stem }}
           PARTS: ${{ needs.ingest.outputs.parts }}
+          TXTAG: ${{ needs.ingest.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           pip install -q cryptography
@@ -204,6 +221,7 @@ jobs:
           openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -salt -pass env:RENDER_KEY -in "$STEM.wav.json" -out "$STEM.wav.json.enc"
           git clone -q --depth 1 -b drive-out "https://x-access-token:${{ github.token }}@github.com/$GITHUB_REPOSITORY" out 2>/dev/null || {
             git clone -q --depth 1 "https://x-access-token:${{ github.token }}@github.com/$GITHUB_REPOSITORY" out && cd out && git checkout -q --orphan drive-out && git rm -rqf . && cd ..; }
+          if [ -n "${TXTAG:-}" ]; then gh release upload "$TXTAG" -R "$GITHUB_REPOSITORY" "$STEM.wav.json.enc" --clobber; fi
           mkdir -p "out/$STEM" && cp probe.sealed "$STEM.wav.json.sealed" "$STEM.wav.json.enc" status.json "out/$STEM/"
           cd out && git config user.name bot && git config user.email bot@users.noreply.github.com && git add -A && git commit -qm "drive: $STEM ($HAVE/$N parts)"
           for i in 1 2 3 4 5; do git push -q origin HEAD:drive-out && break || { git pull -q --rebase origin drive-out; sleep $((RANDOM % 5 + 2)); }; done
