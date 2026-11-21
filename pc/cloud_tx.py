@@ -21,7 +21,9 @@ def main():
     tmp = tempfile.mkdtemp(prefix="ctx_"); flac = os.path.join(tmp, "audio.flac"); enc = flac + ".enc"
     tr = 1 if n_audio(a.video) >= 2 else 0
     print(f"STEP 1/3 mic audio (track a:{tr})", flush=True)
-    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", a.video, "-map", f"0:a:{tr}", "-ac", "1", "-ar", "16000", "-c:a", "flac", flac], check=True, creationflags=NOWIN)
+    # very quiet mic (TFT 2026-11-17: speech near silence on every track) -> clean + level it so Whisper hears the words
+    af = "highpass=f=80,lowpass=f=8000,dynaudnorm=f=200:g=15:p=0.95:m=30,loudnorm=I=-18:TP=-2"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", a.video, "-map", f"0:a:{tr}", "-af", af, "-ac", "1", "-ar", "16000", "-c:a", "flac", flac], check=True, creationflags=NOWIN)
     rf_pc.enc_file(flac, enc)
     gh = rf_cloud_pc.GH(repo=REPO, log=print)
     gh.delete_release(tag); rel = gh.ensure_release(tag)
